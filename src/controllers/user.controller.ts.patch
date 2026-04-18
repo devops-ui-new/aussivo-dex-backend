@@ -1,0 +1,3 @@
+The sendOTP function needs to:
+1. Check by email FIRST, then by wallet
+2. Handle case where wallet exists with different email
