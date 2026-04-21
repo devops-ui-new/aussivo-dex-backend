@@ -1,4 +1,47 @@
-node_modules
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Env / secrets
 .env
+.env.local
+.env.*.local
+# Keep .env.example tracked as a template
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Caches
+.cache/
+.eslintcache
+
+# Coverage / test artifacts
+coverage/
+*.lcov
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
+
+# Lockfiles — current repo convention ignores these (keep if intentional)
 package-lock.json
-/logs
+yarn.lock
+pnpm-lock.yaml
