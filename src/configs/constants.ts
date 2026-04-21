@@ -11,8 +11,11 @@ export const CRON_SECRET = process.env.CRON_SECRET || 'cron-secret-key';
 
 // Blockchain
 export const BSC_PROVIDER_URL = process.env.BSC_PROVIDER_URL || 'https://bsc-dataseed1.binance.org';
+export const BSC_CHAIN_ID = parseInt(process.env.BSC_CHAIN_ID || '97'); // 56 mainnet, 97 testnet
 export const VAULT_CONTRACT_ADDRESS = process.env.VAULT_CONTRACT_ADDRESS || '';
 export const ADMIN_WALLET_PRIVATE_KEY = process.env.ADMIN_WALLET_PRIVATE_KEY || '';
+export const USDT_CONTRACT_ADDRESS = process.env.USDT_CONTRACT_ADDRESS || '0x337610d27c682E347C9cD60BD4b3b107C9d34dDd';
+export const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS || '0x64544969ed7EBf5f083679233325356EbE738930';
 
 // Email (SMTP)
 export const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';

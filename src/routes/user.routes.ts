@@ -22,6 +22,9 @@ router.post('/wallet-auth', async (req: Request, res: Response) => {
 router.get('/me', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).getUserDetails(); return sendResponse(res, r.status, r);
 });
+router.post('/link-wallet', authenticateUser, async (req: Request, res: Response) => {
+  const r = await new UserController(req, res).linkWallet(req.body); return sendResponse(res, r.status, r);
+});
 
 // ── Vaults ──
 router.get('/vaults', async (req: Request, res: Response) => {

@@ -150,40 +150,6 @@ export default class AdminController {
     }
   }
 
-  // ── MANUAL DEPOSIT (admin confirms on-chain deposit) ──
-  async confirmDeposit(body: { userId: string; vaultId: string; amount: number; txHash?: string }): Promise<IResponse> {
-    try {
-      const { userId, vaultId, amount, txHash } = body;
-      const user = await UserModel.findById(userId);
-      if (!user) return { data: null, error: 'User not found', message: 'User not found', status: 404 };
-
-      const vault = await VaultModel.findById(vaultId);
-      if (!vault) return { data: null, error: 'Vault not found', message: 'Vault not found', status: 404 };
-
-      let tierIndex = 0;
-      let apyPercent = vault.tiers[0]?.apyPercent || 0;
-      for (let i = vault.tiers.length - 1; i >= 0; i--) {
-        if (amount >= vault.tiers[i].minAmount) { tierIndex = i; apyPercent = vault.tiers[i].apyPercent; break; }
-      }
-
-      const lockUntil = vault.lockDays > 0 ? new Date(Date.now() + vault.lockDays * 86400000) : null;
-      const deposit = await DepositModel.create({
-        userId, vaultId, amount, asset: vault.asset, txHash: txHash || '',
-        walletAddress: user.walletAddress, lockUntil, apyPercent, tierIndex,
-        maxYieldPayments: vault.durationMonths, status: 'active',
-      });
-
-      await VaultModel.findByIdAndUpdate(vaultId, { $inc: { totalStaked: amount, totalUsers: 1 } });
-      const balField = vault.asset === 'USDT' ? 'usdtBalance' : 'usdcBalance';
-      await UserModel.findByIdAndUpdate(userId, { $inc: { [balField]: amount, totalDeposited: amount } });
-
-      await ActivityModel.create({ adminId: this.adminId, title: 'Deposit Confirmed', description: `Admin confirmed $${amount} ${vault.asset} deposit for ${user.email}`, type: 'admin' });
-      return { data: deposit, error: null, message: 'Deposit confirmed', status: 201 };
-    } catch (err: any) {
-      return { data: null, error: err.message, message: 'Error', status: 500 };
-    }
-  }
-
   // ── WITHDRAWAL MANAGEMENT ──
   async getWithdrawRequests(page = 1, limit = 20, status?: string): Promise<IResponse> {
     try {

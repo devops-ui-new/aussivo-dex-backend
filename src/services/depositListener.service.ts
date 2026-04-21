@@ -1,9 +1,10 @@
 import { ethers } from 'ethers';
-import { BSC_PROVIDER_URL, VAULT_CONTRACT_ADDRESS } from '../configs/constants';
+import { BSC_PROVIDER_URL, VAULT_CONTRACT_ADDRESS, USDT_CONTRACT_ADDRESS, USDC_CONTRACT_ADDRESS } from '../configs/constants';
 import DepositModel from '../models/deposit.model';
 import UserModel from '../models/user.model';
 import VaultModel from '../models/vault.model';
 import ActivityModel from '../models/activity.model';
+import PendingDepositModel from '../models/pendingDeposit.model';
 import { sendEmail } from '../configs/email.config';
 import logger from '../configs/logger.config';
 
@@ -46,25 +47,47 @@ export class DepositListenerService {
     logger.info(`[DepositListener] Starting... Watching ${VAULT_CONTRACT_ADDRESS}`);
 
     try {
-      // Watch for ERC20 transfers TO the vault address
-      // This covers both USDT and USDC deposits
-      const usdtAddresses = [
-        '0x55d398326f99059fF775485246999027B3197955', // BSC USDT
-        '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', // BSC USDC
+      // Watch for ERC20 transfers TO the vault address (both USDT & USDC)
+      const tokens = [
+        { addr: USDT_CONTRACT_ADDRESS, symbol: 'USDT' },
+        { addr: USDC_CONTRACT_ADDRESS, symbol: 'USDC' },
       ];
 
-      for (const tokenAddr of usdtAddresses) {
+      for (const { addr: tokenAddr, symbol } of tokens) {
         const tokenContract = new ethers.Contract(tokenAddr, ERC20_ABI, this.provider);
         const decimals = await tokenContract.decimals().catch(() => 18);
-        const symbol = tokenAddr.includes('55d398') ? 'USDT' : 'USDC';
 
         // Filter: any Transfer TO our vault address
         const filter = tokenContract.filters.Transfer(null, VAULT_CONTRACT_ADDRESS);
 
-        tokenContract.on(filter, async (from: string, to: string, value: bigint, event: any) => {
+        tokenContract.on(filter, async (...listenerArgs: any[]) => {
           try {
+            // ethers v6 quirk: with typed filters, decoded positional args can arrive
+            // as null. Parse the raw log instead, which is always reliable.
+            const event = listenerArgs[listenerArgs.length - 1];
+            const log = event?.log || event;
+            if (!log?.topics || !log?.data) {
+              logger.warn(`[DepositListener] ${symbol} event missing log payload`);
+              return;
+            }
+            const parsed = tokenContract.interface.parseLog({
+              topics: [...log.topics],
+              data: log.data,
+            });
+            if (!parsed) {
+              logger.warn(`[DepositListener] ${symbol} log could not be parsed`);
+              return;
+            }
+            const from: string = parsed.args.from;
+            const value: bigint = parsed.args.value;
+            const txHash: string = log.transactionHash || '';
+
+            if (value == null) {
+              logger.warn(`[DepositListener] ${symbol} parsed value was null — skipping tx ${txHash}`);
+              return;
+            }
+
             const amount = parseFloat(ethers.formatUnits(value, decimals));
-            const txHash = event.log?.transactionHash || '';
 
             logger.info(`[DepositListener] ${symbol} transfer detected: ${amount} from ${from} tx:${txHash}`);
 
@@ -75,22 +98,84 @@ export class DepositListenerService {
               return;
             }
 
-            // Find user by wallet address
-            const user = await UserModel.findOne({ walletAddress: from.toLowerCase() });
+            // Per-vault routing. Order of matching:
+            //   1. Pending intent with matching wallet + asset + amount (best — user's linked wallet paid)
+            //   2. Pending intent with matching asset + amount, only if UNIQUE (QR scan from a
+            //      different wallet than the one linked to the user's account)
+            //   3. User lookup by wallet (legacy path, no pending intent)
+            const AMOUNT_TOLERANCE = 0.01;
+            const now = new Date();
+
+            let pending = await PendingDepositModel.findOne({
+              walletAddress: from.toLowerCase(),
+              asset: symbol,
+              status: 'pending',
+              expiresAt: { $gt: now },
+              expectedAmount: { $gte: amount - AMOUNT_TOLERANCE, $lte: amount + AMOUNT_TOLERANCE },
+            }).sort({ createdAt: -1 });
+
+            if (!pending) {
+              const candidates = await PendingDepositModel.find({
+                asset: symbol,
+                status: 'pending',
+                expiresAt: { $gt: now },
+                expectedAmount: { $gte: amount - AMOUNT_TOLERANCE, $lte: amount + AMOUNT_TOLERANCE },
+              }).sort({ createdAt: 1 });
+              if (candidates.length === 1) {
+                pending = candidates[0];
+                logger.info(`[DepositListener] Cross-wallet match: intent ${pending._id} for user ${pending.userId} claims tx from ${from}`);
+              } else if (candidates.length > 1) {
+                logger.warn(`[DepositListener] ${candidates.length} active intents match ${amount} ${symbol} from ${from} — refusing to auto-route`);
+              }
+            }
+
+            let user: any = null;
+            if (pending) {
+              user = await UserModel.findById(pending.userId);
+            }
             if (!user) {
-              logger.warn(`[DepositListener] No user found for wallet ${from}, deposit will need manual confirmation`);
-              // Log it for admin to review
+              user = await UserModel.findOne({ walletAddress: from.toLowerCase() });
+            }
+            if (!user) {
+              logger.warn(`[DepositListener] No user or pending intent for ${amount} ${symbol} from ${from}`);
               await ActivityModel.create({
                 title: 'Unknown Deposit Detected',
                 description: `${amount} ${symbol} from unknown wallet ${from}`,
                 type: 'system',
-                metadata: { from, amount, symbol, txHash }
+                metadata: { from, amount, symbol, txHash },
               });
               return;
             }
 
-            // Find appropriate vault (first active vault matching the asset)
-            const vault = await VaultModel.findOne({ asset: symbol, status: 'active' }).sort({ createdAt: -1 });
+            // If we matched via a cross-wallet intent and the user's stored wallet is
+            // a placeholder (e.g. "email_…"), upgrade it to the wallet that actually paid.
+            const storedWallet = (user.walletAddress || '').toLowerCase();
+            if (pending && !storedWallet.startsWith('0x')) {
+              const fromLower = from.toLowerCase();
+              const conflict = await UserModel.findOne({ walletAddress: fromLower, _id: { $ne: user._id } });
+              if (!conflict) {
+                user.walletAddress = fromLower;
+                await user.save();
+                logger.info(`[DepositListener] Auto-linked wallet ${fromLower} to user ${user.email}`);
+              }
+            }
+
+            let vault;
+            if (pending) {
+              vault = await VaultModel.findById(pending.vaultId);
+              if (vault) {
+                await PendingDepositModel.findByIdAndUpdate(pending._id, {
+                  status: 'matched',
+                  matchedTxHash: txHash,
+                  matchedAt: now,
+                });
+                logger.info(`[DepositListener] Matched intent ${pending._id} → vault ${vault.name}`);
+              }
+            }
+            if (!vault) {
+              vault = await VaultModel.findOne({ asset: symbol, status: 'active' }).sort({ createdAt: -1 });
+              if (vault) logger.warn(`[DepositListener] No pending intent for ${from} ${amount} ${symbol}, falling back to newest active vault ${vault.name}`);
+            }
             if (!vault) {
               logger.warn(`[DepositListener] No active ${symbol} vault found`);
               return;

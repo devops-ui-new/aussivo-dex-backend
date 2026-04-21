@@ -8,7 +8,8 @@ import YieldLogModel from "../models/yieldLog.model";
 import OtpModel from "../models/otp.model";
 import ActivityModel from "../models/activity.model";
 import WithdrawRequestModel from "../models/withdrawRequest.model";
-import { JWT_SECRET } from "../configs/constants";
+import PendingDepositModel from "../models/pendingDeposit.model";
+import { JWT_SECRET, VAULT_CONTRACT_ADDRESS, USDT_CONTRACT_ADDRESS, USDC_CONTRACT_ADDRESS, BSC_CHAIN_ID } from "../configs/constants";
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
@@ -404,37 +405,79 @@ export default class UserController {
           status: 400,
         };
 
-      // Generate deposit address QR (in production this would be the vault contract address)
-      const depositAddress =
-        vault.contractAddress || "0xVAULT_CONTRACT_ADDRESS_HERE";
-      const qrData = JSON.stringify({
-        to: depositAddress,
-        amount: amount.toString(),
-        asset: vault.asset,
-        network: "BSC",
-        memo: `vault:${vaultId}:user:${this.userId}`,
-      });
+      // Deployed AussivoVault contract on BSC — users send USDT/USDC here.
+      // DepositListener watches for ERC-20 Transfer events to this address.
+      const depositAddress = VAULT_CONTRACT_ADDRESS;
+      if (!depositAddress) {
+        return {
+          data: null,
+          error: "Vault contract not configured",
+          message: "Vault contract address not set",
+          status: 500,
+        };
+      }
 
-      const qrCodeDataUrl = await QRCode.toDataURL(qrData, {
+      // BSC BEP-20 token contracts (USDT & USDC both use 18 decimals on BSC)
+      const TOKEN_ADDRESSES: Record<string, string> = {
+        USDT: USDT_CONTRACT_ADDRESS,
+        USDC: USDC_CONTRACT_ADDRESS,
+      };
+      const tokenAddress = TOKEN_ADDRESSES[vault.asset];
+      const decimals = 18;
+      const amountInBaseUnits = BigInt(Math.round(amount * 10 ** 6)) * BigInt(10 ** (decimals - 6));
+
+      // EIP-681 ERC-20 transfer URI with chainId.
+      // Format: ethereum:<token>@<chainId>/transfer?address=<recipient>&uint256=<amount>
+      // EIP-681-compliant wallets (recent MetaMask Mobile, Coinbase Wallet) will
+      // prompt the user to switch network. Wallets that ignore @chainId fall
+      // back to the user's currently selected network — which is why the
+      // instructions still tell users to switch to BSC Testnet first.
+      const qrPayload = `ethereum:${tokenAddress}@${BSC_CHAIN_ID}/transfer?address=${depositAddress}&uint256=${amountInBaseUnits.toString()}`;
+
+      const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
         width: 300,
         margin: 2,
         color: { dark: "#000000", light: "#ffffff" },
       });
 
+      // Per-vault routing: record a pending deposit intent so the listener
+      // credits the transfer to the vault the user actually chose.
+      const user = await UserModel.findById(this.userId);
+      if (!user?.walletAddress) {
+        return {
+          data: null,
+          error: "No wallet address",
+          message: "Link a wallet address before depositing",
+          status: 400,
+        };
+      }
+      const INTENT_TTL_MS = 60 * 60 * 1000; // 1 hour
+      await PendingDepositModel.create({
+        userId: this.userId,
+        vaultId,
+        expectedAmount: amount,
+        asset: vault.asset,
+        walletAddress: user.walletAddress.toLowerCase(),
+        expiresAt: new Date(Date.now() + INTENT_TTL_MS),
+      });
+
       return {
         data: {
           qrCode: qrCodeDataUrl,
+          qrPayload,
           depositAddress,
+          tokenAddress,
           amount,
           asset: vault.asset,
-          network: "BNB Smart Chain (BEP-20)",
+          network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
+          chainId: BSC_CHAIN_ID,
           vaultName: vault.name,
           memo: `vault:${vaultId}:user:${this.userId}`,
           instructions: [
-            `Send exactly ${amount} ${vault.asset} to the address below`,
-            "Use BNB Smart Chain (BEP-20) network only",
-            "Deposit will be confirmed after 12 block confirmations",
-            "Do NOT send any other token to this address",
+            `Switch your wallet to ${BSC_CHAIN_ID === 56 ? "BNB Smart Chain (chainId 56)" : "BSC Testnet (chainId 97)"} BEFORE scanning`,
+            `Scan the QR — your wallet will open a prefilled ${vault.asset} transfer to sign`,
+            `If ${vault.asset} isn't recognized, add it as a custom token first: ${tokenAddress}`,
+            "Confirm the transaction — deposit auto-confirms after on-chain confirmation",
           ],
         },
         error: null,
@@ -782,6 +825,34 @@ export default class UserController {
         message: "Authentication failed",
         status: 500,
       };
+    }
+  }
+
+  // ── LINK / UPDATE WALLET ADDRESS ──
+  async linkWallet(body: { walletAddress: string }): Promise<IResponse> {
+    try {
+      const { walletAddress } = body;
+      if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress))
+        return { data: null, error: "Invalid wallet", message: "Valid wallet address required", status: 400 };
+
+      const normalized = walletAddress.toLowerCase();
+
+      const inUse = await UserModel.findOne({ walletAddress: normalized, _id: { $ne: this.userId } });
+      if (inUse)
+        return { data: null, error: "Wallet in use", message: "This wallet is already linked to another account", status: 409 };
+
+      const user = await UserModel.findByIdAndUpdate(
+        this.userId,
+        { walletAddress: normalized },
+        { new: true, runValidators: true },
+      );
+      if (!user)
+        return { data: null, error: "Not found", message: "User not found", status: 404 };
+
+      logger.info(`[AUTH] Wallet linked: ${user.email} → ${normalized}`);
+      return { data: { walletAddress: user.walletAddress }, error: null, message: "Wallet linked", status: 200 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: "Failed to link wallet", status: 500 };
     }
   }
 }
