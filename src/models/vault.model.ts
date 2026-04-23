@@ -19,6 +19,8 @@ const VaultSchema = new Schema({
   totalStaked: { type: Number, default: 0 },
   totalUsers: { type: Number, default: 0 },
   earlyExitFeeBps: { type: Number, default: 0 },           // basis points e.g. 500 = 5%
+  displayApy: { type: Number, default: null },             // admin-set annual APY shown on /pools and /pool/:id (overrides tier calc)
+  displayApyMonthly: { type: Number, default: null },      // admin-set monthly APY shown in badges (overrides tier calc)
   tiers: { type: [TierSchema], required: true },
   strategies: [{
     name: { type: String, required: true },
