@@ -177,8 +177,17 @@ export default class AdminController {
           status: 'completed', txHash: txHash || '', reviewedBy: this.adminId, reviewNote: note || ''
         });
         await UserModel.findByIdAndUpdate(request.userId, { $inc: { totalWithdrawn: request.amount } });
+
+        // Deposit (principal) redemptions: mark deposit withdrawn and decrement vault TVL
+        if (request.source === 'deposit' && request.depositId) {
+          const deposit = await DepositModel.findById(request.depositId);
+          if (deposit && deposit.status === 'active') {
+            await DepositModel.findByIdAndUpdate(request.depositId, { status: 'withdrawn', withdrawnAt: new Date() });
+            await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: -deposit.amount, totalUsers: -1 } });
+          }
+        }
       } else {
-        // Refund balance
+        // Refund off-chain balance (yield/referral). Deposit redemptions have no debit, so nothing to refund.
         let balanceField = '';
         if (request.source === 'yield') balanceField = request.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
         else if (request.source === 'referral') balanceField = 'referralEarnings';

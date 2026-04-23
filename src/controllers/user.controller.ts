@@ -595,16 +595,19 @@ export default class UserController {
   async getDeposits(page = 1, limit = 10): Promise<IResponse> {
     try {
       const skip = (page - 1) * limit;
-      const [deposits, total] = await Promise.all([
+      const [deposits, total, pendingRedemptions] = await Promise.all([
         DepositModel.find({ userId: this.userId })
           .populate("vaultId", "name asset")
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit),
         DepositModel.countDocuments({ userId: this.userId }),
+        WithdrawRequestModel.find({ userId: this.userId, source: "deposit", status: "pending" }).select("depositId"),
       ]);
+      const pendingSet = new Set(pendingRedemptions.map((r: any) => String(r.depositId)));
+      const withFlag = deposits.map((d: any) => ({ ...d.toObject(), redemptionPending: pendingSet.has(String(d._id)) }));
       return {
-        data: { deposits, total, page, limit, pages: Math.ceil(total / limit) },
+        data: { deposits: withFlag, total, page, limit, pages: Math.ceil(total / limit) },
         error: null,
         message: "Deposits retrieved",
         status: 200,
@@ -702,9 +705,10 @@ export default class UserController {
     asset: string;
     source: string;
     walletAddress: string;
+    depositId?: string;
   }): Promise<IResponse> {
     try {
-      const { amount, asset, source, walletAddress } = body;
+      const { amount, asset, source, walletAddress, depositId } = body;
       const user = await UserModel.findById(this.userId);
       if (!user)
         return {
@@ -714,7 +718,36 @@ export default class UserController {
           status: 404,
         };
 
-      // Check balance based on source
+      // ── DEPOSIT (principal) redemption ──
+      if (source === "deposit") {
+        if (!depositId)
+          return { data: null, error: "Missing depositId", message: "depositId is required for deposit redemption", status: 400 };
+
+        const deposit = await DepositModel.findById(depositId);
+        if (!deposit || String(deposit.userId) !== String(user._id))
+          return { data: null, error: "Not found", message: "Deposit not found", status: 404 };
+        if (deposit.status !== "active")
+          return { data: null, error: "Invalid state", message: "Deposit is not redeemable", status: 400 };
+        if (deposit.lockUntil && new Date(deposit.lockUntil) > new Date())
+          return { data: null, error: "Locked", message: "Deposit is still locked", status: 400 };
+
+        const existing = await WithdrawRequestModel.findOne({ depositId: deposit._id, status: "pending" });
+        if (existing)
+          return { data: null, error: "Duplicate", message: "Redemption already requested for this deposit", status: 400 };
+
+        const request = await WithdrawRequestModel.create({
+          userId: user._id,
+          amount: deposit.amount,
+          asset: deposit.asset,
+          walletAddress,
+          source: "deposit",
+          depositId: deposit._id,
+        });
+
+        return { data: request, error: null, message: "Redemption request submitted", status: 201 };
+      }
+
+      // ── YIELD / REFERRAL off-chain balance withdrawals ──
       let balanceField = "";
       if (source === "yield")
         balanceField = asset === "USDT" ? "yieldWalletUSDT" : "yieldWalletUSDC";

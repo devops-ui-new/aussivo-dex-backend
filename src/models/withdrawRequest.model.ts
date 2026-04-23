@@ -6,6 +6,7 @@ const WithdrawRequestSchema = new Schema({
   asset: { type: String, enum: ['USDT', 'USDC'], required: true },
   walletAddress: { type: String, required: true },
   source: { type: String, enum: ['yield', 'deposit', 'referral'], required: true },
+  depositId: { type: Types.ObjectId, ref: 'deposits', default: null, index: true },
   txHash: { type: String, default: '' },
   status: { type: String, enum: ['pending', 'approved', 'rejected', 'completed'], default: 'pending' },
   reviewedBy: { type: Types.ObjectId, ref: 'admins', default: null },
