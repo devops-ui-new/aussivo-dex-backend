@@ -11,6 +11,7 @@ import ActivityModel from '../models/activity.model';
 import { JWT_SECRET } from '../configs/constants';
 import { IResponse } from '../utils/response.util';
 import { distributeMonthlyAPY } from '../helpers/apyDistribution.helper';
+import { isVaultPayoutConfigured, payoutUserOnChain } from '../services/vaultPayout.service';
 import logger from '../configs/logger.config';
 
 export default class AdminController {
@@ -107,6 +108,7 @@ export default class AdminController {
           { name: { $regex: search, $options: 'i' } },
           { email: { $regex: search, $options: 'i' } },
           { walletAddress: { $regex: search, $options: 'i' } },
+          { walletAddresses: { $regex: search, $options: 'i' } },
         ];
       }
       const skip = (page - 1) * limit;
@@ -173,9 +175,34 @@ export default class AdminController {
       if (!request || request.status !== 'pending') return { data: null, error: 'Not found', message: 'Request not found or already processed', status: 404 };
 
       if (action === 'approve') {
-        await WithdrawRequestModel.findByIdAndUpdate(requestId, {
-          status: 'completed', txHash: txHash || '', reviewedBy: this.adminId, reviewNote: note || ''
-        });
+        // Atomically claim the request so a concurrent click can't double-spend.
+        const claimed = await WithdrawRequestModel.findOneAndUpdate(
+          { _id: requestId, status: 'pending' },
+          { status: 'approved', reviewedBy: this.adminId, reviewNote: note || '' },
+          { new: true }
+        );
+        if (!claimed) return { data: null, error: 'Conflict', message: 'Request already being processed', status: 409 };
+
+        let finalTxHash = (txHash || '').trim();
+
+        // If no manual hash supplied and the vault signer is configured, auto-pay on-chain.
+        if (!finalTxHash && isVaultPayoutConfigured()) {
+          try {
+            const result = await payoutUserOnChain({
+              asset: request.asset as 'USDT' | 'USDC',
+              userAddress: request.walletAddress,
+              amount: request.amount,
+              reason: `wdreq:${requestId}`,
+            });
+            finalTxHash = result.txHash;
+          } catch (err: any) {
+            // Revert the claim so the admin can retry (assumes tx did not land; admin must verify on-chain if ambiguous).
+            await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'pending', reviewedBy: null, reviewNote: `payout failed: ${err.message}` });
+            return { data: null, error: err.message, message: `On-chain payout failed: ${err.message}`, status: 500 };
+          }
+        }
+
+        await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'completed', txHash: finalTxHash });
         await UserModel.findByIdAndUpdate(request.userId, { $inc: { totalWithdrawn: request.amount } });
 
         // Deposit (principal) redemptions: mark deposit withdrawn and decrement vault TVL
@@ -186,6 +213,9 @@ export default class AdminController {
             await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: -deposit.amount, totalUsers: -1 } });
           }
         }
+
+        await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Approved', type: 'admin', metadata: { requestId, amount: request.amount, txHash: finalTxHash } });
+        return { data: { txHash: finalTxHash }, error: null, message: 'Withdrawal approved', status: 200 };
       } else {
         // Refund off-chain balance (yield/referral). Deposit redemptions have no debit, so nothing to refund.
         let balanceField = '';
@@ -193,10 +223,9 @@ export default class AdminController {
         else if (request.source === 'referral') balanceField = 'referralEarnings';
         if (balanceField) await UserModel.findByIdAndUpdate(request.userId, { $inc: { [balanceField]: request.amount } });
         await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'rejected', reviewedBy: this.adminId, reviewNote: note || '' });
+        await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Rejected', type: 'admin', metadata: { requestId, amount: request.amount } });
+        return { data: null, error: null, message: 'Withdrawal rejected', status: 200 };
       }
-
-      await ActivityModel.create({ adminId: this.adminId, title: `Withdrawal ${action === 'approve' ? 'Approved' : 'Rejected'}`, type: 'admin', metadata: { requestId, amount: request.amount } });
-      return { data: null, error: null, message: `Withdrawal ${action}d`, status: 200 };
     } catch (err: any) {
       return { data: null, error: err.message, message: 'Error', status: 500 };
     }

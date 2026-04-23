@@ -42,23 +42,11 @@ export default class UserController {
           status: 400,
         };
 
-      // Check by email first
+      const wallet = walletAddress ? walletAddress.toLowerCase() : null;
+
+      // Email is the login identity; look up by email first.
       let user = await UserModel.findOne({ email: email.toLowerCase() });
 
-      // If no user by email, check by wallet (prevent duplicate wallet)
-      if (!user && walletAddress) {
-        user = await UserModel.findOne({
-          walletAddress: walletAddress.toLowerCase(),
-        });
-        if (user) {
-          // Wallet exists with different email — update email
-          user.email = email.toLowerCase();
-          user.name = name || user.name;
-          await user.save();
-        }
-      }
-
-      // Auto-register new users
       if (!user) {
         let referredBy = null;
         if (referralCode) {
@@ -71,11 +59,11 @@ export default class UserController {
         user = await UserModel.create({
           name: name || email.split("@")[0],
           email: email.toLowerCase(),
-          walletAddress: walletAddress
-            ? walletAddress.toLowerCase()
-            : `email_${Date.now()}`,
+          walletAddress: wallet || null,
+          walletAddresses: wallet ? [wallet] : [],
           referralCode: genCode(),
           referredBy,
+          registeredWith: wallet ? "wallet" : "email",
         });
 
         await ActivityModel.create({
@@ -84,6 +72,17 @@ export default class UserController {
           type: "system",
           description: `New user registered`,
         });
+      } else if (wallet && !(user.walletAddresses || []).includes(wallet)) {
+        // Known email, new wallet — append (uniqueness enforced by linkWallet-style check).
+        const conflict = await UserModel.findOne({
+          _id: { $ne: user._id },
+          $or: [{ walletAddress: wallet }, { walletAddresses: wallet }],
+        });
+        if (!conflict) {
+          user.walletAddresses = [...(user.walletAddresses || []), wallet];
+          if (!user.walletAddress) user.walletAddress = wallet;
+          await user.save();
+        }
       }
 
       // Static OTP for development (replace with random OTP when SMTP is configured)
@@ -252,6 +251,7 @@ export default class UserController {
             name: user.name,
             email: user.email,
             walletAddress: user.walletAddress,
+            walletAddresses: user.walletAddresses || [],
             referralCode: user.referralCode,
           },
         },
@@ -443,11 +443,17 @@ export default class UserController {
       // Per-vault routing: record a pending deposit intent so the listener
       // credits the transfer to the vault the user actually chose.
       const user = await UserModel.findById(this.userId);
-      if (!user?.walletAddress) {
+      const depositWallet = (
+        (body as any).walletAddress ||
+        user?.walletAddress ||
+        (user?.walletAddresses || [])[0] ||
+        ""
+      ).toLowerCase();
+      if (!depositWallet || !depositWallet.startsWith("0x")) {
         return {
           data: null,
           error: "No wallet address",
-          message: "Link a wallet address before depositing",
+          message: "Connect a wallet before depositing",
           status: 400,
         };
       }
@@ -457,7 +463,7 @@ export default class UserController {
         vaultId,
         expectedAmount: amount,
         asset: vault.asset,
-        walletAddress: user.walletAddress.toLowerCase(),
+        walletAddress: depositWallet,
         expiresAt: new Date(Date.now() + INTENT_TTL_MS),
       });
 
@@ -597,7 +603,7 @@ export default class UserController {
       const skip = (page - 1) * limit;
       const [deposits, total, pendingRedemptions] = await Promise.all([
         DepositModel.find({ userId: this.userId })
-          .populate("vaultId", "name asset")
+          .populate("vaultId", "name asset displayApy displayApyMonthly tiers")
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit),
@@ -605,7 +611,25 @@ export default class UserController {
         WithdrawRequestModel.find({ userId: this.userId, source: "deposit", status: "pending" }).select("depositId"),
       ]);
       const pendingSet = new Set(pendingRedemptions.map((r: any) => String(r.depositId)));
-      const withFlag = deposits.map((d: any) => ({ ...d.toObject(), redemptionPending: pendingSet.has(String(d._id)) }));
+      const withFlag = deposits.map((d: any) => {
+        const obj = d.toObject();
+        const v = obj.vaultId || {};
+        const tierMonthly = v.tiers?.[0]?.apyPercent || 0;
+        const poolApy =
+          v.displayApy != null ? Number(v.displayApy) : tierMonthly * 12;
+        const poolApyMonthly =
+          v.displayApyMonthly != null
+            ? Number(v.displayApyMonthly)
+            : v.displayApy != null
+            ? Number(v.displayApy) / 12
+            : tierMonthly;
+        return {
+          ...obj,
+          redemptionPending: pendingSet.has(String(obj._id)),
+          poolApy: Number(poolApy.toFixed(2)),
+          poolApyMonthly: Number(poolApyMonthly.toFixed(2)),
+        };
+      });
       return {
         data: { deposits: withFlag, total, page, limit, pages: Math.ceil(total / limit) },
         error: null,
@@ -861,7 +885,10 @@ export default class UserController {
     }
   }
 
-  // ── LINK / UPDATE WALLET ADDRESS ──
+  // ── LINK WALLET ADDRESS ──
+  // Adds a wallet to the user's walletAddresses list. If the user has no primary
+  // wallet yet, the new address becomes primary. A single wallet cannot be linked
+  // to two emails.
   async linkWallet(body: { walletAddress: string }): Promise<IResponse> {
     try {
       const { walletAddress } = body;
@@ -870,20 +897,31 @@ export default class UserController {
 
       const normalized = walletAddress.toLowerCase();
 
-      const inUse = await UserModel.findOne({ walletAddress: normalized, _id: { $ne: this.userId } });
-      if (inUse)
+      const conflict = await UserModel.findOne({
+        _id: { $ne: this.userId },
+        $or: [{ walletAddress: normalized }, { walletAddresses: normalized }],
+      });
+      if (conflict)
         return { data: null, error: "Wallet in use", message: "This wallet is already linked to another account", status: 409 };
 
-      const user = await UserModel.findByIdAndUpdate(
-        this.userId,
-        { walletAddress: normalized },
-        { new: true, runValidators: true },
-      );
-      if (!user)
+      const existing = await UserModel.findById(this.userId);
+      if (!existing)
         return { data: null, error: "Not found", message: "User not found", status: 404 };
 
-      logger.info(`[AUTH] Wallet linked: ${user.email} → ${normalized}`);
-      return { data: { walletAddress: user.walletAddress }, error: null, message: "Wallet linked", status: 200 };
+      const list = new Set<string>((existing.walletAddresses || []).map((w: string) => (w || "").toLowerCase()));
+      list.add(normalized);
+
+      existing.walletAddresses = Array.from(list);
+      if (!existing.walletAddress) existing.walletAddress = normalized;
+      await existing.save();
+
+      logger.info(`[AUTH] Wallet linked: ${existing.email} → ${normalized}`);
+      return {
+        data: { walletAddress: existing.walletAddress, walletAddresses: existing.walletAddresses },
+        error: null,
+        message: "Wallet linked",
+        status: 200,
+      };
     } catch (err: any) {
       return { data: null, error: err.message, message: "Failed to link wallet", status: 500 };
     }

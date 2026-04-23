@@ -134,7 +134,10 @@ export class DepositListenerService {
               user = await UserModel.findById(pending.userId);
             }
             if (!user) {
-              user = await UserModel.findOne({ walletAddress: from.toLowerCase() });
+              const fromLower = from.toLowerCase();
+              user = await UserModel.findOne({
+                $or: [{ walletAddress: fromLower }, { walletAddresses: fromLower }],
+              });
             }
             if (!user) {
               logger.warn(`[DepositListener] No user or pending intent for ${amount} ${symbol} from ${from}`);
@@ -147,14 +150,18 @@ export class DepositListenerService {
               return;
             }
 
-            // If we matched via a cross-wallet intent and the user's stored wallet is
-            // a placeholder (e.g. "email_…"), upgrade it to the wallet that actually paid.
-            const storedWallet = (user.walletAddress || '').toLowerCase();
-            if (pending && !storedWallet.startsWith('0x')) {
-              const fromLower = from.toLowerCase();
-              const conflict = await UserModel.findOne({ walletAddress: fromLower, _id: { $ne: user._id } });
+            // Auto-link the paying wallet to this user's walletAddresses so future deposits
+            // from it route directly. Skip if another user already claims this wallet.
+            const fromLower = from.toLowerCase();
+            const known = (user.walletAddresses || []).map((w: string) => (w || '').toLowerCase());
+            if (!known.includes(fromLower)) {
+              const conflict = await UserModel.findOne({
+                _id: { $ne: user._id },
+                $or: [{ walletAddress: fromLower }, { walletAddresses: fromLower }],
+              });
               if (!conflict) {
-                user.walletAddress = fromLower;
+                user.walletAddresses = [...known, fromLower];
+                if (!user.walletAddress || !user.walletAddress.startsWith('0x')) user.walletAddress = fromLower;
                 await user.save();
                 logger.info(`[DepositListener] Auto-linked wallet ${fromLower} to user ${user.email}`);
               }
