@@ -1,5 +1,12 @@
 import { ethers } from 'ethers';
-import { BSC_PROVIDER_URL, VAULT_CONTRACT_ADDRESS, USDT_CONTRACT_ADDRESS, USDC_CONTRACT_ADDRESS } from '../configs/constants';
+import {
+  BSC_CHAIN_ID,
+  BSC_PROVIDER_URL,
+  getCanonicalBscStableDecimals,
+  VAULT_CONTRACT_ADDRESS,
+  USDT_CONTRACT_ADDRESS,
+  USDC_CONTRACT_ADDRESS,
+} from '../configs/constants';
 import DepositModel from '../models/deposit.model';
 import UserModel from '../models/user.model';
 import VaultModel from '../models/vault.model';
@@ -17,7 +24,6 @@ const VAULT_ABI = [
 // USDT/USDC ERC20 Transfer event
 const ERC20_ABI = [
   "event Transfer(address indexed from, address indexed to, uint256 value)",
-  "function decimals() view returns (uint8)",
 ];
 
 export class DepositListenerService {
@@ -25,7 +31,10 @@ export class DepositListenerService {
   private isRunning = false;
 
   constructor() {
-    this.provider = new ethers.JsonRpcProvider(BSC_PROVIDER_URL);
+    this.provider = new ethers.JsonRpcProvider(BSC_PROVIDER_URL, BSC_CHAIN_ID, { staticNetwork: true });
+    this.provider.on('error', (err) => {
+      logger.error(`[DepositListener] RPC provider error: ${(err as Error)?.message || err}`);
+    });
   }
 
   /**
@@ -35,6 +44,10 @@ export class DepositListenerService {
   async start() {
     if (!VAULT_CONTRACT_ADDRESS) {
       logger.warn('[DepositListener] No VAULT_CONTRACT_ADDRESS configured, skipping listener');
+      return;
+    }
+    if (!ethers.isAddress(VAULT_CONTRACT_ADDRESS)) {
+      logger.warn('[DepositListener] Invalid VAULT_CONTRACT_ADDRESS configured, skipping listener');
       return;
     }
 
@@ -54,8 +67,22 @@ export class DepositListenerService {
       ];
 
       for (const { addr: tokenAddr, symbol } of tokens) {
+        if (!ethers.isAddress(tokenAddr)) {
+          logger.warn(`[DepositListener] ${symbol} address is invalid (${tokenAddr}), skipping`);
+          continue;
+        }
+
+        const code = await this.provider.getCode(tokenAddr);
+        if (!code || code === '0x') {
+          logger.warn(`[DepositListener] ${symbol} has no contract code at ${tokenAddr}, skipping`);
+          continue;
+        }
+
+        // Do not call decimals() on-chain: public BSC RPC often returns empty `0x` for eth_call, which
+        // makes ethers v6 throw BUFFER_OVERRUN. Canonical BSC stables are 18 decimals.
+        const decimals = getCanonicalBscStableDecimals(tokenAddr) ?? 18;
+
         const tokenContract = new ethers.Contract(tokenAddr, ERC20_ABI, this.provider);
-        const decimals = await tokenContract.decimals().catch(() => 18);
 
         // Filter: any Transfer TO our vault address
         const filter = tokenContract.filters.Transfer(null, VAULT_CONTRACT_ADDRESS);

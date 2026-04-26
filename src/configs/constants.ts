@@ -11,11 +11,26 @@ export const CRON_SECRET = process.env.CRON_SECRET || 'cron-secret-key';
 
 // Blockchain
 export const BSC_PROVIDER_URL = process.env.BSC_PROVIDER_URL || 'https://bsc-dataseed1.binance.org';
-export const BSC_CHAIN_ID = parseInt(process.env.BSC_CHAIN_ID || '97'); // 56 mainnet, 97 testnet
+const _chain = parseInt(process.env.BSC_CHAIN_ID || '56', 10); // 56 mainnet, 97 testnet
+export const BSC_CHAIN_ID = Number.isFinite(_chain) && _chain > 0 ? _chain : 56;
 export const VAULT_CONTRACT_ADDRESS = process.env.VAULT_CONTRACT_ADDRESS || '';
 export const ADMIN_WALLET_PRIVATE_KEY = process.env.ADMIN_WALLET_PRIVATE_KEY || '';
-export const USDT_CONTRACT_ADDRESS = process.env.USDT_CONTRACT_ADDRESS || '0x337610d27c682E347C9cD60BD4b3b107C9d34dDd';
-export const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS || '0x64544969ed7EBf5f083679233325356EbE738930';
+export const USDT_CONTRACT_ADDRESS = process.env.USDT_CONTRACT_ADDRESS || '0x55d398326f99059fF775485246999027B3197955';
+export const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS || '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
+
+/** Canonical BSC USDT/USDC — all use 18 decimals. Avoids flaky `decimals()` eth_call on public RPC. */
+const CANONICAL_BSC_STABLE_DECIMALS: Record<string, number> = {
+  '0x55d398326f99059f775485246999027b3197955': 18, // mainnet USDT
+  '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 18, // mainnet USDC
+  '0x337610d27c682e347c9cd60bd4b3b107c9d34ddd': 18, // testnet USDT
+  '0x64544969ed7ebbf5f083679233325356ebe738930': 18, // testnet USDC
+};
+
+/** Returns 18 for known BSC stables, else `null` (caller may fall back to 18 or read on-chain). */
+export const getCanonicalBscStableDecimals = (addr: string): number | null => {
+  const k = (addr || '').toLowerCase();
+  return k in CANONICAL_BSC_STABLE_DECIMALS ? CANONICAL_BSC_STABLE_DECIMALS[k]! : null;
+};
 
 // Email (SMTP)
 export const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';

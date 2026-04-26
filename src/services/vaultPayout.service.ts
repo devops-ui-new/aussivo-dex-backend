@@ -1,7 +1,9 @@
 import { ethers } from 'ethers';
 import {
+  BSC_CHAIN_ID,
   ADMIN_WALLET_PRIVATE_KEY,
   BSC_PROVIDER_URL,
+  getCanonicalBscStableDecimals,
   USDC_CONTRACT_ADDRESS,
   USDT_CONTRACT_ADDRESS,
   VAULT_CONTRACT_ADDRESS,
@@ -20,10 +22,22 @@ const decimalsCache: Record<string, number> = {};
 export const isVaultPayoutConfigured = (): boolean =>
   Boolean(VAULT_CONTRACT_ADDRESS && ADMIN_WALLET_PRIVATE_KEY);
 
-const getProvider = () => new ethers.JsonRpcProvider(BSC_PROVIDER_URL);
+const getProvider = () => new ethers.JsonRpcProvider(BSC_PROVIDER_URL, BSC_CHAIN_ID, { staticNetwork: true });
 
 const getDecimals = async (tokenAddr: string, provider: ethers.JsonRpcProvider): Promise<number> => {
   if (decimalsCache[tokenAddr] != null) return decimalsCache[tokenAddr];
+  if (!ethers.isAddress(tokenAddr)) {
+    throw new Error(`Invalid token address: ${tokenAddr}`);
+  }
+  const known = getCanonicalBscStableDecimals(tokenAddr);
+  if (known != null) {
+    decimalsCache[tokenAddr] = known;
+    return known;
+  }
+  const code = await provider.getCode(tokenAddr);
+  if (!code || code === '0x') {
+    throw new Error(`No contract code found at token address: ${tokenAddr}`);
+  }
   const token = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
   const d = Number(await token.decimals());
   decimalsCache[tokenAddr] = d;
