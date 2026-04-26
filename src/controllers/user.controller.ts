@@ -474,6 +474,8 @@ export default class UserController {
           depositAddress,
           tokenAddress,
           amount,
+          /** Exact on-chain uint256; wallet pay flow should use this to avoid float/parseUnit drift. */
+          amountInBaseUnits: amountInBaseUnits.toString(),
           asset: vault.asset,
           network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
           chainId: BSC_CHAIN_ID,
