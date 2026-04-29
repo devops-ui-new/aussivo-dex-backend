@@ -37,7 +37,8 @@ export const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 export const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587');
 export const SMTP_USER = process.env.SMTP_USER || '';
 export const SMTP_PASS = process.env.SMTP_PASS || '';
-export const EMAIL_FROM = process.env.EMAIL_FROM || 'noreply@aussivo.com';
+export const EMAIL_FROM = process.env.SMTP_FROM || process.env.EMAIL_FROM || 'noreply@aussivo.com';
+export const EMAIL_FROM_NAME = process.env.SMTP_FROM_NAME || process.env.EMAIL_FROM_NAME || 'Aussivo.DEX';
 
 // APY Config
 export const APY_CRON_SCHEDULE = process.env.APY_CRON_SCHEDULE || '0 0 1 * *';

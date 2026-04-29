@@ -7,6 +7,8 @@ const OtpSchema = new Schema({
   purpose: { type: String, enum: ['login', 'withdraw', 'transfer', 'admin-login'], required: true },
   expiresAt: { type: Date, required: true },
   status: { type: String, enum: ['pending', 'used', 'expired'], default: 'pending' },
+  failedAttempts: { type: Number, default: 0 },
+  lockedUntil: { type: Date, default: null },
 }, { timestamps: true });
 
 OtpSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });

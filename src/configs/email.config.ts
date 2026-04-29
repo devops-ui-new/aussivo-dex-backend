@@ -1,5 +1,5 @@
 import nodemailer from 'nodemailer';
-import { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM } from './constants';
+import { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, EMAIL_FROM_NAME } from './constants';
 import logger from './logger.config';
 import fs from 'fs';
 import path from 'path';
@@ -44,7 +44,7 @@ export const sendEmail = async (to: string, subject: string, templateName: strin
     }
 
     const info = await transporter.sendMail({
-      from: `"Aussivo.DEX" <${EMAIL_FROM}>`,
+      from: `"${EMAIL_FROM_NAME}" <${EMAIL_FROM}>`,
       to,
       subject,
       html: htmlContent,

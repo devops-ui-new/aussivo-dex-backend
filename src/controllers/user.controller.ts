@@ -1,6 +1,8 @@
 import { Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import QRCode from "qrcode";
+import { randomInt } from "crypto";
+import { createHash } from "crypto";
 import UserModel from "../models/user.model";
 import VaultModel from "../models/vault.model";
 import DepositModel from "../models/deposit.model";
@@ -13,6 +15,11 @@ import { JWT_SECRET, VAULT_CONTRACT_ADDRESS, USDT_CONTRACT_ADDRESS, USDC_CONTRAC
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
+
+const generateOtpCode = (): string => randomInt(100000, 1000000).toString();
+const hashOtpCode = (otp: string): string => createHash("sha256").update(otp).digest("hex");
+const OTP_MAX_VERIFY_ATTEMPTS = 5;
+const OTP_LOCKOUT_MINUTES = 15;
 
 export default class UserController {
   req: Request;
@@ -85,9 +92,8 @@ export default class UserController {
         }
       }
 
-      // Static OTP for development (replace with random OTP when SMTP is configured)
-      // const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      const otp = "123456";
+      const otp = generateOtpCode();
+      const otpHash = hashOtpCode(otp);
       await OtpModel.deleteMany({
         userId: user._id,
         purpose: "login",
@@ -96,20 +102,21 @@ export default class UserController {
       await OtpModel.create({
         userId: user._id,
         email: user.email,
-        otp,
+        otp: otpHash,
         purpose: "login",
         expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 min
+        failedAttempts: 0,
+        lockedUntil: null,
       });
 
-      logger.info(`[OTP] User ${email}: ${otp}`);
+      logger.info(`[OTP] Generated login OTP for ${email}`);
 
-      // Email sending — uncomment when SMTP is configured
-      // try {
-      //   await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
-      //   logger.info(`[OTP] Email sent to ${email}`);
-      // } catch (emailErr: any) {
-      //   logger.error(`[OTP] Email send failed for ${email}: ${emailErr.message}`);
-      // }
+      try {
+        await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
+        logger.info(`[OTP] Email sent to ${email}`);
+      } catch (emailErr: any) {
+        logger.error(`[OTP] Email send failed for ${email}: ${emailErr.message}`);
+      }
 
       return {
         data: { email: user.email, isNew: !body.walletAddress },
@@ -156,9 +163,8 @@ export default class UserController {
         };
       }
 
-      // Static OTP for development
-      // const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      const otp = "123456";
+      const otp = generateOtpCode();
+      const otpHash = hashOtpCode(otp);
       await OtpModel.deleteMany({
         userId: user._id,
         purpose: "login",
@@ -167,16 +173,17 @@ export default class UserController {
       await OtpModel.create({
         userId: user._id,
         email: user.email,
-        otp,
+        otp: otpHash,
         purpose: "login",
         expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+        failedAttempts: 0,
+        lockedUntil: null,
       });
 
-      logger.info(`[OTP] Wallet auto-login ${user.email}: ${otp}`);
-      // Email sending — uncomment when SMTP is configured
-      // try {
-      //   await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
-      // } catch (e: any) { logger.error(`[OTP] Email failed: ${e.message}`); }
+      logger.info(`[OTP] Generated wallet-login OTP for ${user.email}`);
+      try {
+        await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
+      } catch (e: any) { logger.error(`[OTP] Email failed: ${e.message}`); }
 
       // Mask email for display: abc@gmail.com → a**@gmail.com
       const [local, domain] = user.email.split("@");
@@ -212,11 +219,10 @@ export default class UserController {
 
       const otpRecord = await OtpModel.findOne({
         email: email.toLowerCase(),
-        otp,
         purpose: "login",
         status: "pending",
         expiresAt: { $gt: new Date() },
-      });
+      }).sort({ createdAt: -1 });
 
       if (!otpRecord)
         return {
@@ -226,7 +232,42 @@ export default class UserController {
           status: 400,
         };
 
-      await OtpModel.findByIdAndUpdate(otpRecord._id, { status: "used" });
+      if (otpRecord.lockedUntil && new Date(otpRecord.lockedUntil) > new Date()) {
+        const waitSec = Math.max(1, Math.ceil((new Date(otpRecord.lockedUntil).getTime() - Date.now()) / 1000));
+        return {
+          data: null,
+          error: "Too many attempts",
+          message: `Too many invalid attempts. Try again in ${waitSec}s`,
+          status: 429,
+        };
+      }
+
+      const incomingOtpHash = hashOtpCode(otp);
+      if (incomingOtpHash !== otpRecord.otp) {
+        const failedAttempts = Number((otpRecord as any).failedAttempts || 0) + 1;
+        const shouldLock = failedAttempts >= OTP_MAX_VERIFY_ATTEMPTS;
+        const lockUntil = shouldLock ? new Date(Date.now() + OTP_LOCKOUT_MINUTES * 60 * 1000) : null;
+        await OtpModel.findByIdAndUpdate(otpRecord._id, {
+          failedAttempts,
+          lockedUntil: lockUntil,
+        });
+        if (shouldLock) {
+          return {
+            data: null,
+            error: "Too many attempts",
+            message: `Too many invalid attempts. Locked for ${OTP_LOCKOUT_MINUTES} minutes`,
+            status: 429,
+          };
+        }
+        return {
+          data: null,
+          error: "Invalid OTP",
+          message: `Invalid OTP. ${OTP_MAX_VERIFY_ATTEMPTS - failedAttempts} attempt(s) left`,
+          status: 400,
+        };
+      }
+
+      await OtpModel.findByIdAndUpdate(otpRecord._id, { status: "used", failedAttempts: 0, lockedUntil: null });
 
       const user = await UserModel.findById(otpRecord.userId);
       if (!user)

@@ -2,16 +2,17 @@ import express, { Request, Response } from 'express';
 import UserController from '../controllers/user.controller';
 import { sendResponse } from '../utils/response.util';
 import { authenticateUser } from '../middlewares/auth.middleware';
+import { otpSendRateLimit, otpVerifyRateLimit } from '../middlewares/otpRateLimit.middleware';
 const router = express.Router();
 
 // ── Auth ──
-router.post('/send-otp', async (req: Request, res: Response) => {
+router.post('/send-otp', otpSendRateLimit, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).sendOTP(req.body); return sendResponse(res, r.status, r);
 });
-router.post('/verify-otp', async (req: Request, res: Response) => {
+router.post('/verify-otp', otpVerifyRateLimit, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).verifyOTP(req.body); return sendResponse(res, r.status, r);
 });
-router.post('/wallet-login', async (req: Request, res: Response) => {
+router.post('/wallet-login', otpSendRateLimit, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).walletLogin(req.body); return sendResponse(res, r.status, r);
 });
 router.post('/wallet-auth', async (req: Request, res: Response) => {
