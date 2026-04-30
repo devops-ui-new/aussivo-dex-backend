@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import QRCode from "qrcode";
 import { randomInt } from "crypto";
 import { createHash } from "crypto";
+import { randomBytes } from "crypto";
 import UserModel from "../models/user.model";
 import VaultModel from "../models/vault.model";
 import DepositModel from "../models/deposit.model";
@@ -466,14 +467,15 @@ export default class UserController {
       const tokenAddress = TOKEN_ADDRESSES[vault.asset];
       const decimals = 18;
       const amountInBaseUnits = BigInt(Math.round(amount * 10 ** 6)) * BigInt(10 ** (decimals - 6));
+      const requestId = `0x${randomBytes(32).toString("hex")}`;
 
-      // EIP-681 ERC-20 transfer URI with chainId.
-      // Format: ethereum:<token>@<chainId>/transfer?address=<recipient>&uint256=<amount>
-      // EIP-681-compliant wallets (recent MetaMask Mobile, Coinbase Wallet) will
-      // prompt the user to switch network. Wallets that ignore @chainId fall
-      // back to the user's currently selected network — which is why the
-      // instructions still tell users to switch to BSC Testnet first.
-      const qrPayload = `ethereum:${tokenAddress}@${BSC_CHAIN_ID}/transfer?address=${depositAddress}&uint256=${amountInBaseUnits.toString()}`;
+      const depositFunction =
+        vault.asset === "USDT" ? "depositUSDTWithRequest" : "depositUSDCWithRequest";
+      // EIP-681 function-call payloads for wallet apps that support contract method QR.
+      // Query keys match ABI parameter names.
+      const qrPayload = `ethereum:${depositAddress}@${BSC_CHAIN_ID}/${depositFunction}?amount=${amountInBaseUnits.toString()}&vaultId=${encodeURIComponent(vaultId)}&requestId=${requestId}`;
+      const qrPayloadWithoutChainId = `ethereum:${depositAddress}/${depositFunction}?amount=${amountInBaseUnits.toString()}&vaultId=${encodeURIComponent(vaultId)}&requestId=${requestId}`;
+      const qrPayloadAddressOnly = depositAddress;
 
       const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
         width: 300,
@@ -503,6 +505,8 @@ export default class UserController {
         userId: this.userId,
         vaultId,
         expectedAmount: amount,
+        expectedAmountBaseUnits: amountInBaseUnits.toString(),
+        requestId,
         asset: vault.asset,
         walletAddress: depositWallet,
         expiresAt: new Date(Date.now() + INTENT_TTL_MS),
@@ -512,11 +516,16 @@ export default class UserController {
         data: {
           qrCode: qrCodeDataUrl,
           qrPayload,
+          qrPayloadWithoutChainId,
+          qrPayloadAddressOnly,
           depositAddress,
           tokenAddress,
           amount,
           /** Exact on-chain uint256; wallet pay flow should use this to avoid float/parseUnit drift. */
           amountInBaseUnits: amountInBaseUnits.toString(),
+          requestId,
+          vaultContractAddress: depositAddress,
+          depositFunction,
           asset: vault.asset,
           network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
           chainId: BSC_CHAIN_ID,
@@ -524,7 +533,8 @@ export default class UserController {
           memo: `vault:${vaultId}:user:${this.userId}`,
           instructions: [
             `Switch your wallet to ${BSC_CHAIN_ID === 56 ? "BNB Smart Chain (chainId 56)" : "BSC Testnet (chainId 97)"} BEFORE scanning`,
-            `Scan the QR — your wallet will open a prefilled ${vault.asset} transfer to sign`,
+            `Scan the QR — supported wallets open ${depositFunction}(amount, vaultId, requestId) on vault contract`,
+            `If your wallet fails to parse this function-call QR, use in-app wallet button (approve + contract call), then try qrPayloadWithoutChainId`,
             `If ${vault.asset} isn't recognized, add it as a custom token first: ${tokenAddress}`,
             "Confirm the transaction — deposit auto-confirms after on-chain confirmation",
           ],

@@ -4,6 +4,8 @@ const PendingDepositSchema = new Schema({
   userId: { type: Types.ObjectId, ref: 'users', required: true, index: true },
   vaultId: { type: Types.ObjectId, ref: 'vaults', required: true, index: true },
   expectedAmount: { type: Number, required: true },
+  expectedAmountBaseUnits: { type: String, required: true, index: true },
+  requestId: { type: String, required: true, index: true },
   asset: { type: String, enum: ['USDT', 'USDC'], required: true },
   walletAddress: { type: String, required: true, lowercase: true, index: true },
   status: { type: String, enum: ['pending', 'matched', 'expired'], default: 'pending', index: true },
@@ -12,6 +14,7 @@ const PendingDepositSchema = new Schema({
   matchedAt: { type: Date, default: null },
 }, { timestamps: true, versionKey: false });
 
-PendingDepositSchema.index({ walletAddress: 1, asset: 1, status: 1 });
+PendingDepositSchema.index({ walletAddress: 1, asset: 1, status: 1, expectedAmountBaseUnits: 1 });
+PendingDepositSchema.index({ requestId: 1, status: 1 });
 
 export default model('pending_deposits', PendingDepositSchema);
