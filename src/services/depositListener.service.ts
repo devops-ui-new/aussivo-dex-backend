@@ -61,14 +61,27 @@ export class DepositListenerService {
           try {
             const event = listenerArgs[listenerArgs.length - 1];
             const log = event?.log || event;
+            if (!log?.topics || !log?.data) {
+              logger.warn("[DepositListener] Deposited event missing log payload");
+              return;
+            }
+            const parsed = vaultContract.interface.parseLog({
+              topics: [...log.topics],
+              data: log.data,
+            });
+            if (!parsed) {
+              logger.warn("[DepositListener] Deposited log could not be parsed");
+              return;
+            }
             const txHash: string = log.transactionHash || '';
-            const depositor = String(listenerArgs[0] || "").toLowerCase();
-            const tokenAddress = String(listenerArgs[1] || "").toLowerCase();
-            const value: bigint = listenerArgs[2];
-            const requestId: string = String(listenerArgs[4] || "");
+            const depositor = String(parsed.args.user || "").toLowerCase();
+            const tokenAddress = String(parsed.args.token || "").toLowerCase();
+            const value: bigint = parsed.args.amount;
+            const requestIdRaw: string = String(parsed.args.requestId || "");
+            const requestId = requestIdRaw.toLowerCase();
 
             if (!value || !requestId || requestId === ethers.ZeroHash) {
-              logger.info(`[DepositListener] Legacy/non-request deposit event tx:${txHash}; skipped for deterministic routing`);
+              logger.info(`[DepositListener] Legacy/non-request deposit event tx:${txHash}; requestId=${requestIdRaw || "n/a"} skipped for deterministic routing`);
               return;
             }
 

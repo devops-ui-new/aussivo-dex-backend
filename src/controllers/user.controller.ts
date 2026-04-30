@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import { randomInt } from "crypto";
 import { createHash } from "crypto";
 import { randomBytes } from "crypto";
+import { ethers } from "ethers";
 import UserModel from "../models/user.model";
 import VaultModel from "../models/vault.model";
 import DepositModel from "../models/deposit.model";
@@ -471,10 +472,17 @@ export default class UserController {
 
       const depositFunction =
         vault.asset === "USDT" ? "depositUSDTWithRequest" : "depositUSDCWithRequest";
-      // EIP-681 function-call payloads for wallet apps that support contract method QR.
-      // Query keys match ABI parameter names.
-      const qrPayload = `ethereum:${depositAddress}@${BSC_CHAIN_ID}/${depositFunction}?amount=${amountInBaseUnits.toString()}&vaultId=${encodeURIComponent(vaultId)}&requestId=${requestId}`;
-      const qrPayloadWithoutChainId = `ethereum:${depositAddress}/${depositFunction}?amount=${amountInBaseUnits.toString()}&vaultId=${encodeURIComponent(vaultId)}&requestId=${requestId}`;
+      const iface = new ethers.Interface([
+        "function depositUSDTWithRequest(uint256 amount, string vaultId, bytes32 requestId)",
+        "function depositUSDCWithRequest(uint256 amount, string vaultId, bytes32 requestId)",
+      ]);
+      const txData = iface.encodeFunctionData(depositFunction, [
+        amountInBaseUnits,
+        vaultId,
+        requestId,
+      ]);
+      // Wallet scanner-safe QR (non-EIP-681): plain address.
+      const qrPayload = depositAddress;
       const qrPayloadAddressOnly = depositAddress;
 
       const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
@@ -516,8 +524,14 @@ export default class UserController {
         data: {
           qrCode: qrCodeDataUrl,
           qrPayload,
-          qrPayloadWithoutChainId,
           qrPayloadAddressOnly,
+          tx: {
+            to: depositAddress,
+            value: "0x0",
+            data: txData,
+            chainId: BSC_CHAIN_ID,
+            chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
+          },
           depositAddress,
           tokenAddress,
           amount,
@@ -529,12 +543,13 @@ export default class UserController {
           asset: vault.asset,
           network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
           chainId: BSC_CHAIN_ID,
+          chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
           vaultName: vault.name,
           memo: `vault:${vaultId}:user:${this.userId}`,
           instructions: [
-            `Switch your wallet to ${BSC_CHAIN_ID === 56 ? "BNB Smart Chain (chainId 56)" : "BSC Testnet (chainId 97)"} BEFORE scanning`,
-            `Scan the QR — supported wallets open ${depositFunction}(amount, vaultId, requestId) on vault contract`,
-            `If your wallet fails to parse this function-call QR, use in-app wallet button (approve + contract call), then try qrPayloadWithoutChainId`,
+            `Switch your wallet to ${BSC_CHAIN_ID === 56 ? "BNB Smart Chain (chainId 56 / 0x38)" : "BSC Testnet (chainId 97 / 0x61)"} BEFORE scanning`,
+            "QR is plain vault address for maximum scanner compatibility",
+            `Use in-app wallet button to sign ${depositFunction}(amount, vaultId, requestId)`,
             `If ${vault.asset} isn't recognized, add it as a custom token first: ${tokenAddress}`,
             "Confirm the transaction — deposit auto-confirms after on-chain confirmation",
           ],
