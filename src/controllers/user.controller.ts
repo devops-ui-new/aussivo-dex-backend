@@ -113,11 +113,23 @@ export default class UserController {
 
       logger.info(`[OTP] Generated login OTP for ${email}`);
 
+      let sent = false;
       try {
-        await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
-        logger.info(`[OTP] Email sent to ${email}`);
+        sent = await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
+        if (sent) logger.info(`[OTP] Email sent to ${email}`);
       } catch (emailErr: any) {
         logger.error(`[OTP] Email send failed for ${email}: ${emailErr.message}`);
+      }
+
+      if (!sent) {
+        await OtpModel.deleteMany({ userId: user._id, purpose: "login", status: "pending" });
+        return {
+          data: null,
+          error: "email_delivery_failed",
+          message:
+            "Verification email could not be sent. If this persists, the server mail settings may be missing or invalid (e.g. Railway SMTP variables, Gmail App Password, FROM address matching the mailbox).",
+          status: 503,
+        };
       }
 
       return {
@@ -183,9 +195,23 @@ export default class UserController {
       });
 
       logger.info(`[OTP] Generated wallet-login OTP for ${user.email}`);
+      let sent = false;
       try {
-        await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
-      } catch (e: any) { logger.error(`[OTP] Email failed: ${e.message}`); }
+        sent = await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
+      } catch (e: any) {
+        logger.error(`[OTP] Email failed: ${e.message}`);
+      }
+
+      if (!sent) {
+        await OtpModel.deleteMany({ userId: user._id, purpose: "login", status: "pending" });
+        return {
+          data: { registered: true, email: user.email },
+          error: "email_delivery_failed",
+          message:
+            "Verification email could not be sent. Check server SMTP configuration (Railway env: SMTP_HOST, SMTP_USER, SMTP_PASS; Gmail needs an App Password; FROM should match the sending account).",
+          status: 503,
+        };
+      }
 
       // Mask email for display: abc@gmail.com → a**@gmail.com
       const [local, domain] = user.email.split("@");
