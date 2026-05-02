@@ -991,6 +991,30 @@ export default class UserController {
 
       const normalized = walletAddress.toLowerCase();
 
+      const existing = await UserModel.findById(this.userId);
+      if (!existing)
+        return { data: null, error: "Not found", message: "User not found", status: 404 };
+
+      const list = new Set<string>((existing.walletAddresses || []).map((w: string) => (w || "").toLowerCase()));
+      const primary = (existing.walletAddress || "").toLowerCase();
+
+      // Same account, same wallet (e.g. primary set but missing from walletAddresses — common with WalletConnect / OTP flows)
+      if (primary === normalized || list.has(normalized)) {
+        let patched = false;
+        if (primary === normalized && !list.has(normalized)) {
+          list.add(normalized);
+          existing.walletAddresses = Array.from(list);
+          patched = true;
+        }
+        if (patched) await existing.save();
+        return {
+          data: { walletAddress: existing.walletAddress, walletAddresses: existing.walletAddresses },
+          error: null,
+          message: "Wallet already linked",
+          status: 200,
+        };
+      }
+
       const conflict = await UserModel.findOne({
         _id: { $ne: this.userId },
         $or: [{ walletAddress: normalized }, { walletAddresses: normalized }],
@@ -998,13 +1022,7 @@ export default class UserController {
       if (conflict)
         return { data: null, error: "Wallet in use", message: "This wallet is already linked to another account", status: 409 };
 
-      const existing = await UserModel.findById(this.userId);
-      if (!existing)
-        return { data: null, error: "Not found", message: "User not found", status: 404 };
-
-      const list = new Set<string>((existing.walletAddresses || []).map((w: string) => (w || "").toLowerCase()));
       list.add(normalized);
-
       existing.walletAddresses = Array.from(list);
       if (!existing.walletAddress) existing.walletAddress = normalized;
       await existing.save();
