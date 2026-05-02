@@ -13,12 +13,16 @@ router.use('/admin', adminRoutes);
 
 // ═══ Frontend compatibility routes ═══
 
-const formatVault = (v: any) => ({
+const formatVault = (v: any) => {
+  const tierMonthly = v.tiers?.[0]?.apyPercent || 0;
+  const annual = v.displayApy != null ? v.displayApy : tierMonthly * 12;
+  const monthly = v.displayApyMonthly != null ? v.displayApyMonthly : (v.displayApy != null ? v.displayApy / 12 : tierMonthly);
+  return {
   ...v.toObject ? v.toObject() : v,
   id: v._id,
-  apy: v.tiers?.[0]?.apyPercent ? (v.tiers[0].apyPercent * 12).toFixed(1) : '0',
-  apyMonthly: v.tiers?.[0]?.apyPercent?.toFixed(2) || '0',
-  apy_bps: Math.round((v.tiers?.[0]?.apyPercent || 0) * 100),
+  apy: Number(annual).toFixed(1),
+  apyMonthly: Number(monthly).toFixed(2),
+  apy_bps: Math.round(Number(monthly) * 100),
   lockDays: v.lockDays || 0,
   lock_period: (v.lockDays || 0) * 86400,
   totalStakedFormatted: (v.totalStaked || 0).toLocaleString(),
@@ -31,7 +35,8 @@ const formatVault = (v: any) => ({
   capacity: (v.capacity || 0) * 1e6,
   early_exit_fee_bps: v.earlyExitFeeBps || 0,
   active: v.status === 'active' ? 1 : 0,
-});
+  };
+};
 
 // /api/pools → list all active vaults
 router.get('/pools', async (req, res) => {

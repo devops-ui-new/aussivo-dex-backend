@@ -39,10 +39,6 @@ router.get('/deposits', authenticateAdmin, async (req: Request, res: Response) =
   const r = await new AdminController(req, res).getAllDeposits(Number(req.query.page) || 1, Number(req.query.limit) || 20, req.query.vaultId as string, req.query.status as string);
   return sendResponse(res, r.status, r);
 });
-router.post('/deposits/confirm', authenticateAdmin, async (req: Request, res: Response) => {
-  const r = await new AdminController(req, res).confirmDeposit(req.body); return sendResponse(res, r.status, r);
-});
-
 // Withdrawals
 router.get('/withdrawals', authenticateAdmin, async (req: Request, res: Response) => {
   const r = await new AdminController(req, res).getWithdrawRequests(Number(req.query.page) || 1, Number(req.query.limit) || 20, req.query.status as string);

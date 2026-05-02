@@ -1,0 +1,13 @@
+[build]
+builder = "NIXPACKS"
+# Note: `npm ci` conflicts with Railway's build-cache mount at
+# /app/node_modules/.cache (EBUSY on rmdir). `npm install` respects the
+# lockfile when present and doesn't do the destructive pre-wipe.
+buildCommand = "NODE_OPTIONS='--max-old-space-size=4096' npm install --no-audit --no-fund && NODE_OPTIONS='--max-old-space-size=4096' npm run build"
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/"
+healthcheckTimeout = 30

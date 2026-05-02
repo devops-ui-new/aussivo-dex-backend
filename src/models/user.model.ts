@@ -3,10 +3,13 @@ import { model, Schema, Types } from 'mongoose';
 const UserSchema = new Schema({
   name: { type: String, required: true, trim: true },
   email: { type: String, required: true, unique: true, trim: true, lowercase: true },
-  walletAddress: { type: String, required: true, trim: true, unique: true, lowercase: true },
+  // Primary wallet — kept for display/backward compat. Not required; email is the login identity.
+  walletAddress: { type: String, trim: true, lowercase: true, default: null, sparse: true, unique: true },
+  // All wallets linked to this email. A single wallet may only appear on one user.
+  walletAddresses: { type: [String], default: [] },
   referralCode: { type: String, required: true, unique: true, trim: true },
   referredBy: { type: Schema.Types.ObjectId, ref: 'users', default: null },
-  registeredWith: { type: String, enum: ['wallet', 'email'], default: 'wallet' },
+  registeredWith: { type: String, enum: ['wallet', 'email'], default: 'email' },
 
   // Balances
   usdtBalance: { type: Number, default: 0 },        // deposited USDT
@@ -20,6 +23,8 @@ const UserSchema = new Schema({
   status: { type: String, enum: ['active', 'suspended', 'deleted'], default: 'active' },
   kycStatus: { type: String, enum: ['none', 'pending', 'verified'], default: 'none' },
 }, { timestamps: true });
+
+UserSchema.index({ walletAddresses: 1 });
 
 // Prevent negative balances
 UserSchema.pre(['findOneAndUpdate', 'updateOne'], async function(next) {

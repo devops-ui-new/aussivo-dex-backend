@@ -1,6 +1,10 @@
 import { Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import QRCode from "qrcode";
+import { randomInt } from "crypto";
+import { createHash } from "crypto";
+import { randomBytes } from "crypto";
+import { ethers } from "ethers";
 import UserModel from "../models/user.model";
 import VaultModel from "../models/vault.model";
 import DepositModel from "../models/deposit.model";
@@ -8,10 +12,16 @@ import YieldLogModel from "../models/yieldLog.model";
 import OtpModel from "../models/otp.model";
 import ActivityModel from "../models/activity.model";
 import WithdrawRequestModel from "../models/withdrawRequest.model";
-import { JWT_SECRET } from "../configs/constants";
+import PendingDepositModel from "../models/pendingDeposit.model";
+import { JWT_SECRET, VAULT_CONTRACT_ADDRESS, USDT_CONTRACT_ADDRESS, USDC_CONTRACT_ADDRESS, BSC_CHAIN_ID } from "../configs/constants";
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
+
+const generateOtpCode = (): string => randomInt(100000, 1000000).toString();
+const hashOtpCode = (otp: string): string => createHash("sha256").update(otp).digest("hex");
+const OTP_MAX_VERIFY_ATTEMPTS = 5;
+const OTP_LOCKOUT_MINUTES = 15;
 
 export default class UserController {
   req: Request;
@@ -41,23 +51,11 @@ export default class UserController {
           status: 400,
         };
 
-      // Check by email first
+      const wallet = walletAddress ? walletAddress.toLowerCase() : null;
+
+      // Email is the login identity; look up by email first.
       let user = await UserModel.findOne({ email: email.toLowerCase() });
 
-      // If no user by email, check by wallet (prevent duplicate wallet)
-      if (!user && walletAddress) {
-        user = await UserModel.findOne({
-          walletAddress: walletAddress.toLowerCase(),
-        });
-        if (user) {
-          // Wallet exists with different email — update email
-          user.email = email.toLowerCase();
-          user.name = name || user.name;
-          await user.save();
-        }
-      }
-
-      // Auto-register new users
       if (!user) {
         let referredBy = null;
         if (referralCode) {
@@ -70,11 +68,11 @@ export default class UserController {
         user = await UserModel.create({
           name: name || email.split("@")[0],
           email: email.toLowerCase(),
-          walletAddress: walletAddress
-            ? walletAddress.toLowerCase()
-            : `email_${Date.now()}`,
+          walletAddress: wallet || null,
+          walletAddresses: wallet ? [wallet] : [],
           referralCode: genCode(),
           referredBy,
+          registeredWith: wallet ? "wallet" : "email",
         });
 
         await ActivityModel.create({
@@ -83,11 +81,21 @@ export default class UserController {
           type: "system",
           description: `New user registered`,
         });
+      } else if (wallet && !(user.walletAddresses || []).includes(wallet)) {
+        // Known email, new wallet — append (uniqueness enforced by linkWallet-style check).
+        const conflict = await UserModel.findOne({
+          _id: { $ne: user._id },
+          $or: [{ walletAddress: wallet }, { walletAddresses: wallet }],
+        });
+        if (!conflict) {
+          user.walletAddresses = [...(user.walletAddresses || []), wallet];
+          if (!user.walletAddress) user.walletAddress = wallet;
+          await user.save();
+        }
       }
 
-      // Static OTP for development (replace with random OTP when SMTP is configured)
-      // const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      const otp = "123456";
+      const otp = generateOtpCode();
+      const otpHash = hashOtpCode(otp);
       await OtpModel.deleteMany({
         userId: user._id,
         purpose: "login",
@@ -96,20 +104,33 @@ export default class UserController {
       await OtpModel.create({
         userId: user._id,
         email: user.email,
-        otp,
+        otp: otpHash,
         purpose: "login",
         expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 min
+        failedAttempts: 0,
+        lockedUntil: null,
       });
 
-      logger.info(`[OTP] User ${email}: ${otp}`);
+      logger.info(`[OTP] Generated login OTP for ${email}`);
 
-      // Email sending — uncomment when SMTP is configured
-      // try {
-      //   await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
-      //   logger.info(`[OTP] Email sent to ${email}`);
-      // } catch (emailErr: any) {
-      //   logger.error(`[OTP] Email send failed for ${email}: ${emailErr.message}`);
-      // }
+      let sent = false;
+      try {
+        sent = await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
+        if (sent) logger.info(`[OTP] Email sent to ${email}`);
+      } catch (emailErr: any) {
+        logger.error(`[OTP] Email send failed for ${email}: ${emailErr.message}`);
+      }
+
+      if (!sent) {
+        await OtpModel.deleteMany({ userId: user._id, purpose: "login", status: "pending" });
+        return {
+          data: null,
+          error: "email_delivery_failed",
+          message:
+            "Verification email could not be sent. If this persists, the server mail settings may be missing or invalid (e.g. Railway SMTP variables, Gmail App Password, FROM address matching the mailbox).",
+          status: 503,
+        };
+      }
 
       return {
         data: { email: user.email, isNew: !body.walletAddress },
@@ -156,9 +177,8 @@ export default class UserController {
         };
       }
 
-      // Static OTP for development
-      // const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      const otp = "123456";
+      const otp = generateOtpCode();
+      const otpHash = hashOtpCode(otp);
       await OtpModel.deleteMany({
         userId: user._id,
         purpose: "login",
@@ -167,16 +187,31 @@ export default class UserController {
       await OtpModel.create({
         userId: user._id,
         email: user.email,
-        otp,
+        otp: otpHash,
         purpose: "login",
         expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+        failedAttempts: 0,
+        lockedUntil: null,
       });
 
-      logger.info(`[OTP] Wallet auto-login ${user.email}: ${otp}`);
-      // Email sending — uncomment when SMTP is configured
-      // try {
-      //   await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
-      // } catch (e: any) { logger.error(`[OTP] Email failed: ${e.message}`); }
+      logger.info(`[OTP] Generated wallet-login OTP for ${user.email}`);
+      let sent = false;
+      try {
+        sent = await sendEmail(user.email, 'Your Verification Code — Aussivo.DEX', 'otp-verification', { otp, purpose: 'login' });
+      } catch (e: any) {
+        logger.error(`[OTP] Email failed: ${e.message}`);
+      }
+
+      if (!sent) {
+        await OtpModel.deleteMany({ userId: user._id, purpose: "login", status: "pending" });
+        return {
+          data: { registered: true, email: user.email },
+          error: "email_delivery_failed",
+          message:
+            "Verification email could not be sent. Check server SMTP configuration (Railway env: SMTP_HOST, SMTP_USER, SMTP_PASS; Gmail needs an App Password; FROM should match the sending account).",
+          status: 503,
+        };
+      }
 
       // Mask email for display: abc@gmail.com → a**@gmail.com
       const [local, domain] = user.email.split("@");
@@ -212,11 +247,10 @@ export default class UserController {
 
       const otpRecord = await OtpModel.findOne({
         email: email.toLowerCase(),
-        otp,
         purpose: "login",
         status: "pending",
         expiresAt: { $gt: new Date() },
-      });
+      }).sort({ createdAt: -1 });
 
       if (!otpRecord)
         return {
@@ -226,7 +260,42 @@ export default class UserController {
           status: 400,
         };
 
-      await OtpModel.findByIdAndUpdate(otpRecord._id, { status: "used" });
+      if (otpRecord.lockedUntil && new Date(otpRecord.lockedUntil) > new Date()) {
+        const waitSec = Math.max(1, Math.ceil((new Date(otpRecord.lockedUntil).getTime() - Date.now()) / 1000));
+        return {
+          data: null,
+          error: "Too many attempts",
+          message: `Too many invalid attempts. Try again in ${waitSec}s`,
+          status: 429,
+        };
+      }
+
+      const incomingOtpHash = hashOtpCode(otp);
+      if (incomingOtpHash !== otpRecord.otp) {
+        const failedAttempts = Number((otpRecord as any).failedAttempts || 0) + 1;
+        const shouldLock = failedAttempts >= OTP_MAX_VERIFY_ATTEMPTS;
+        const lockUntil = shouldLock ? new Date(Date.now() + OTP_LOCKOUT_MINUTES * 60 * 1000) : null;
+        await OtpModel.findByIdAndUpdate(otpRecord._id, {
+          failedAttempts,
+          lockedUntil: lockUntil,
+        });
+        if (shouldLock) {
+          return {
+            data: null,
+            error: "Too many attempts",
+            message: `Too many invalid attempts. Locked for ${OTP_LOCKOUT_MINUTES} minutes`,
+            status: 429,
+          };
+        }
+        return {
+          data: null,
+          error: "Invalid OTP",
+          message: `Invalid OTP. ${OTP_MAX_VERIFY_ATTEMPTS - failedAttempts} attempt(s) left`,
+          status: 400,
+        };
+      }
+
+      await OtpModel.findByIdAndUpdate(otpRecord._id, { status: "used", failedAttempts: 0, lockedUntil: null });
 
       const user = await UserModel.findById(otpRecord.userId);
       if (!user)
@@ -251,6 +320,7 @@ export default class UserController {
             name: user.name,
             email: user.email,
             walletAddress: user.walletAddress,
+            walletAddresses: user.walletAddresses || [],
             referralCode: user.referralCode,
           },
         },
@@ -404,37 +474,110 @@ export default class UserController {
           status: 400,
         };
 
-      // Generate deposit address QR (in production this would be the vault contract address)
-      const depositAddress =
-        vault.contractAddress || "0xVAULT_CONTRACT_ADDRESS_HERE";
-      const qrData = JSON.stringify({
-        to: depositAddress,
-        amount: amount.toString(),
-        asset: vault.asset,
-        network: "BSC",
-        memo: `vault:${vaultId}:user:${this.userId}`,
-      });
+      // Deployed AussivoVault contract on BSC — users send USDT/USDC here.
+      // DepositListener watches for ERC-20 Transfer events to this address.
+      const depositAddress = VAULT_CONTRACT_ADDRESS;
+      if (!depositAddress) {
+        return {
+          data: null,
+          error: "Vault contract not configured",
+          message: "Vault contract address not set",
+          status: 500,
+        };
+      }
 
-      const qrCodeDataUrl = await QRCode.toDataURL(qrData, {
+      // BSC BEP-20 token contracts (USDT & USDC both use 18 decimals on BSC)
+      const TOKEN_ADDRESSES: Record<string, string> = {
+        USDT: USDT_CONTRACT_ADDRESS,
+        USDC: USDC_CONTRACT_ADDRESS,
+      };
+      const tokenAddress = TOKEN_ADDRESSES[vault.asset];
+      const decimals = 18;
+      const amountInBaseUnits = BigInt(Math.round(amount * 10 ** 6)) * BigInt(10 ** (decimals - 6));
+      const requestId = `0x${randomBytes(32).toString("hex")}`;
+
+      const depositFunction =
+        vault.asset === "USDT" ? "depositUSDTWithRequest" : "depositUSDCWithRequest";
+      const iface = new ethers.Interface([
+        "function depositUSDTWithRequest(uint256 amount, string vaultId, bytes32 requestId)",
+        "function depositUSDCWithRequest(uint256 amount, string vaultId, bytes32 requestId)",
+      ]);
+      const txData = iface.encodeFunctionData(depositFunction, [
+        amountInBaseUnits,
+        vaultId,
+        requestId,
+      ]);
+      // Wallet scanner-safe QR (non-EIP-681): plain address.
+      const qrPayload = depositAddress;
+      const qrPayloadAddressOnly = depositAddress;
+
+      const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
         width: 300,
         margin: 2,
         color: { dark: "#000000", light: "#ffffff" },
       });
 
+      // Per-vault routing: record a pending deposit intent so the listener
+      // credits the transfer to the vault the user actually chose.
+      const user = await UserModel.findById(this.userId);
+      const depositWallet = (
+        (body as any).walletAddress ||
+        user?.walletAddress ||
+        (user?.walletAddresses || [])[0] ||
+        ""
+      ).toLowerCase();
+      if (!depositWallet || !depositWallet.startsWith("0x")) {
+        return {
+          data: null,
+          error: "No wallet address",
+          message: "Connect a wallet before depositing",
+          status: 400,
+        };
+      }
+      const INTENT_TTL_MS = 60 * 60 * 1000; // 1 hour
+      await PendingDepositModel.create({
+        userId: this.userId,
+        vaultId,
+        expectedAmount: amount,
+        expectedAmountBaseUnits: amountInBaseUnits.toString(),
+        requestId,
+        asset: vault.asset,
+        walletAddress: depositWallet,
+        expiresAt: new Date(Date.now() + INTENT_TTL_MS),
+      });
+
       return {
         data: {
           qrCode: qrCodeDataUrl,
+          qrPayload,
+          qrPayloadAddressOnly,
+          tx: {
+            to: depositAddress,
+            value: "0x0",
+            data: txData,
+            chainId: BSC_CHAIN_ID,
+            chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
+          },
           depositAddress,
+          tokenAddress,
           amount,
+          /** Exact on-chain uint256; wallet pay flow should use this to avoid float/parseUnit drift. */
+          amountInBaseUnits: amountInBaseUnits.toString(),
+          requestId,
+          vaultContractAddress: depositAddress,
+          depositFunction,
           asset: vault.asset,
-          network: "BNB Smart Chain (BEP-20)",
+          network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
+          chainId: BSC_CHAIN_ID,
+          chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
           vaultName: vault.name,
           memo: `vault:${vaultId}:user:${this.userId}`,
           instructions: [
-            `Send exactly ${amount} ${vault.asset} to the address below`,
-            "Use BNB Smart Chain (BEP-20) network only",
-            "Deposit will be confirmed after 12 block confirmations",
-            "Do NOT send any other token to this address",
+            `Switch your wallet to ${BSC_CHAIN_ID === 56 ? "BNB Smart Chain (chainId 56 / 0x38)" : "BSC Testnet (chainId 97 / 0x61)"} BEFORE scanning`,
+            "QR is plain vault address for maximum scanner compatibility",
+            `Use in-app wallet button to sign ${depositFunction}(amount, vaultId, requestId)`,
+            `If ${vault.asset} isn't recognized, add it as a custom token first: ${tokenAddress}`,
+            "Confirm the transaction — deposit auto-confirms after on-chain confirmation",
           ],
         },
         error: null,
@@ -552,16 +695,37 @@ export default class UserController {
   async getDeposits(page = 1, limit = 10): Promise<IResponse> {
     try {
       const skip = (page - 1) * limit;
-      const [deposits, total] = await Promise.all([
+      const [deposits, total, pendingRedemptions] = await Promise.all([
         DepositModel.find({ userId: this.userId })
-          .populate("vaultId", "name asset")
+          .populate("vaultId", "name asset displayApy displayApyMonthly tiers")
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit),
         DepositModel.countDocuments({ userId: this.userId }),
+        WithdrawRequestModel.find({ userId: this.userId, source: "deposit", status: "pending" }).select("depositId"),
       ]);
+      const pendingSet = new Set(pendingRedemptions.map((r: any) => String(r.depositId)));
+      const withFlag = deposits.map((d: any) => {
+        const obj = d.toObject();
+        const v = obj.vaultId || {};
+        const tierMonthly = v.tiers?.[0]?.apyPercent || 0;
+        const poolApy =
+          v.displayApy != null ? Number(v.displayApy) : tierMonthly * 12;
+        const poolApyMonthly =
+          v.displayApyMonthly != null
+            ? Number(v.displayApyMonthly)
+            : v.displayApy != null
+            ? Number(v.displayApy) / 12
+            : tierMonthly;
+        return {
+          ...obj,
+          redemptionPending: pendingSet.has(String(obj._id)),
+          poolApy: Number(poolApy.toFixed(2)),
+          poolApyMonthly: Number(poolApyMonthly.toFixed(2)),
+        };
+      });
       return {
-        data: { deposits, total, page, limit, pages: Math.ceil(total / limit) },
+        data: { deposits: withFlag, total, page, limit, pages: Math.ceil(total / limit) },
         error: null,
         message: "Deposits retrieved",
         status: 200,
@@ -659,9 +823,10 @@ export default class UserController {
     asset: string;
     source: string;
     walletAddress: string;
+    depositId?: string;
   }): Promise<IResponse> {
     try {
-      const { amount, asset, source, walletAddress } = body;
+      const { amount, asset, source, walletAddress, depositId } = body;
       const user = await UserModel.findById(this.userId);
       if (!user)
         return {
@@ -671,7 +836,36 @@ export default class UserController {
           status: 404,
         };
 
-      // Check balance based on source
+      // ── DEPOSIT (principal) redemption ──
+      if (source === "deposit") {
+        if (!depositId)
+          return { data: null, error: "Missing depositId", message: "depositId is required for deposit redemption", status: 400 };
+
+        const deposit = await DepositModel.findById(depositId);
+        if (!deposit || String(deposit.userId) !== String(user._id))
+          return { data: null, error: "Not found", message: "Deposit not found", status: 404 };
+        if (deposit.status !== "active")
+          return { data: null, error: "Invalid state", message: "Deposit is not redeemable", status: 400 };
+        if (deposit.lockUntil && new Date(deposit.lockUntil) > new Date())
+          return { data: null, error: "Locked", message: "Deposit is still locked", status: 400 };
+
+        const existing = await WithdrawRequestModel.findOne({ depositId: deposit._id, status: "pending" });
+        if (existing)
+          return { data: null, error: "Duplicate", message: "Redemption already requested for this deposit", status: 400 };
+
+        const request = await WithdrawRequestModel.create({
+          userId: user._id,
+          amount: deposit.amount,
+          asset: deposit.asset,
+          walletAddress,
+          source: "deposit",
+          depositId: deposit._id,
+        });
+
+        return { data: request, error: null, message: "Redemption request submitted", status: 201 };
+      }
+
+      // ── YIELD / REFERRAL off-chain balance withdrawals ──
       let balanceField = "";
       if (source === "yield")
         balanceField = asset === "USDT" ? "yieldWalletUSDT" : "yieldWalletUSDC";
@@ -782,6 +976,48 @@ export default class UserController {
         message: "Authentication failed",
         status: 500,
       };
+    }
+  }
+
+  // ── LINK WALLET ADDRESS ──
+  // Adds a wallet to the user's walletAddresses list. If the user has no primary
+  // wallet yet, the new address becomes primary. A single wallet cannot be linked
+  // to two emails.
+  async linkWallet(body: { walletAddress: string }): Promise<IResponse> {
+    try {
+      const { walletAddress } = body;
+      if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress))
+        return { data: null, error: "Invalid wallet", message: "Valid wallet address required", status: 400 };
+
+      const normalized = walletAddress.toLowerCase();
+
+      const conflict = await UserModel.findOne({
+        _id: { $ne: this.userId },
+        $or: [{ walletAddress: normalized }, { walletAddresses: normalized }],
+      });
+      if (conflict)
+        return { data: null, error: "Wallet in use", message: "This wallet is already linked to another account", status: 409 };
+
+      const existing = await UserModel.findById(this.userId);
+      if (!existing)
+        return { data: null, error: "Not found", message: "User not found", status: 404 };
+
+      const list = new Set<string>((existing.walletAddresses || []).map((w: string) => (w || "").toLowerCase()));
+      list.add(normalized);
+
+      existing.walletAddresses = Array.from(list);
+      if (!existing.walletAddress) existing.walletAddress = normalized;
+      await existing.save();
+
+      logger.info(`[AUTH] Wallet linked: ${existing.email} → ${normalized}`);
+      return {
+        data: { walletAddress: existing.walletAddress, walletAddresses: existing.walletAddresses },
+        error: null,
+        message: "Wallet linked",
+        status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: "Failed to link wallet", status: 500 };
     }
   }
 }
