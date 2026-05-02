@@ -986,17 +986,29 @@ export default class UserController {
   async linkWallet(body: { walletAddress: string }): Promise<IResponse> {
     try {
       const { walletAddress } = body;
-      if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress))
+      if (!walletAddress || typeof walletAddress !== "string")
         return { data: null, error: "Invalid wallet", message: "Valid wallet address required", status: 400 };
 
-      const normalized = walletAddress.toLowerCase();
+      let normalized: string;
+      try {
+        normalized = ethers.getAddress(walletAddress.trim()).toLowerCase();
+      } catch {
+        return { data: null, error: "Invalid wallet", message: "Valid wallet address required", status: 400 };
+      }
+
+      if (!this.userId)
+        return { data: null, error: "Unauthorized", message: "Authentication required", status: 401 };
 
       const existing = await UserModel.findById(this.userId);
       if (!existing)
         return { data: null, error: "Not found", message: "User not found", status: 404 };
 
-      const list = new Set<string>((existing.walletAddresses || []).map((w: string) => (w || "").toLowerCase()));
-      const primary = (existing.walletAddress || "").toLowerCase();
+      const list = new Set<string>(
+        (existing.walletAddresses || [])
+          .map((w: string) => (w || "").trim().toLowerCase())
+          .filter(Boolean),
+      );
+      const primary = (existing.walletAddress || "").trim().toLowerCase();
 
       // Same account, same wallet (e.g. primary set but missing from walletAddresses — common with WalletConnect / OTP flows)
       if (primary === normalized || list.has(normalized)) {
@@ -1015,8 +1027,10 @@ export default class UserController {
         };
       }
 
+      // Use DB user id (not JWT string alone) so $ne never mis-fires and flags the same user as "another account".
+      const selfId = existing._id;
       const conflict = await UserModel.findOne({
-        _id: { $ne: this.userId },
+        _id: { $ne: selfId },
         $or: [{ walletAddress: normalized }, { walletAddresses: normalized }],
       });
       if (conflict)
