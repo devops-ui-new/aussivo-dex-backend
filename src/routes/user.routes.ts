@@ -39,6 +39,14 @@ router.get('/vault/:id', async (req: Request, res: Response) => {
 router.post('/deposit/qr', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).getDepositQR(req.body); return sendResponse(res, r.status, r);
 });
+router.get('/deposit/pending/:pendingId/status', authenticateUser, async (req: Request, res: Response) => {
+  const r = await new UserController(req, res).getDepositPendingStatus(req.params.pendingId);
+  return sendResponse(res, r.status, r);
+});
+router.post('/deposit/pending/cancel', authenticateUser, async (req: Request, res: Response) => {
+  const r = await new UserController(req, res).cancelPendingDeposit(req.body);
+  return sendResponse(res, r.status, r);
+});
 router.post('/deposit/confirm', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).recordDeposit(req.body); return sendResponse(res, r.status, r);
 });

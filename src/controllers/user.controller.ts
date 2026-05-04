@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { Types } from "mongoose";
 import jwt from "jsonwebtoken";
 import QRCode from "qrcode";
 import { randomInt } from "crypto";
@@ -13,7 +14,14 @@ import OtpModel from "../models/otp.model";
 import ActivityModel from "../models/activity.model";
 import WithdrawRequestModel from "../models/withdrawRequest.model";
 import PendingDepositModel from "../models/pendingDeposit.model";
-import { JWT_SECRET, USDT_CONTRACT_ADDRESS, USDC_CONTRACT_ADDRESS, BSC_CHAIN_ID, EPHEMERAL_WALLET_SECRET } from "../configs/constants";
+import {
+  JWT_SECRET,
+  USDT_CONTRACT_ADDRESS,
+  USDC_CONTRACT_ADDRESS,
+  BSC_CHAIN_ID,
+  BSC_PROVIDER_URL,
+  EPHEMERAL_WALLET_SECRET,
+} from "../configs/constants";
 import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/walletCrypto.helper";
 import { fundEphemeralGas } from "../services/ephemeralDepositSweep.service";
 import { IResponse } from "../utils/response.util";
@@ -552,12 +560,7 @@ export default class UserController {
           expiresAt: expiresAt.toISOString(),
           expiresInSeconds: Math.floor(INTENT_TTL_MS / 1000),
           gasFundTxHash: gasFundTxHash || undefined,
-          instructions: [
-            `QR uses EIP-681: it should pre-fill ${vault.asset} (token contract), recipient (one-time address), and exact amount on chain ${BSC_CHAIN_ID}. You still confirm from your own wallet — "from" is whichever account you use to sign.`,
-            `Send exactly ${amount} ${vault.asset} within 15 minutes (expires ${expiresAt.toISOString()} server time).`,
-            "If your wallet does not support payment URLs, use “Copy address” and send the same amount manually.",
-            "After your transfer confirms on-chain, your vault balance is credited immediately; funds are then swept to our treasury (may take a short moment if gas is topping up).",
-          ],
+          pendingDepositId: String(pendingDoc._id),
         },
         error: null,
         message: "Deposit address generated",
@@ -570,6 +573,97 @@ export default class UserController {
         message: "Error generating QR",
         status: 500,
       };
+    }
+  }
+
+  /** Poll while deposit modal is open — tells UI when USDT arrived (credited / matched). */
+  async getDepositPendingStatus(pendingId: string): Promise<IResponse> {
+    try {
+      if (!pendingId || !Types.ObjectId.isValid(pendingId)) {
+        return { data: null, error: "Invalid id", message: "Invalid pending deposit id", status: 400 };
+      }
+      const doc = await PendingDepositModel.findOne({ _id: pendingId, userId: this.userId }).lean();
+      if (!doc) {
+        return { data: null, error: "Not found", message: "Pending deposit not found", status: 404 };
+      }
+      const paymentReceived = doc.status === "credited" || doc.status === "matched";
+      const fullySettled = doc.status === "matched";
+      return {
+        data: {
+          status: doc.status,
+          paymentReceived,
+          fullySettled,
+          expiresAt: doc.expiresAt,
+          userCreditedAt: doc.userCreditedAt || null,
+          sweepTxHash: doc.sweepTxHash || "",
+        },
+        error: null,
+        message: "OK",
+        status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: "Error", status: 500 };
+    }
+  }
+
+  /**
+   * User closed the deposit modal without completing payment — delete intent and key material
+   * only if no tokens have arrived yet (on-chain balance 0) and user has not been credited.
+   */
+  async cancelPendingDeposit(body: { pendingDepositId?: string }): Promise<IResponse> {
+    try {
+      const pendingDepositId = (body?.pendingDepositId || "").trim();
+      if (!pendingDepositId || !Types.ObjectId.isValid(pendingDepositId)) {
+        return { data: null, error: "Invalid id", message: "Invalid pending deposit id", status: 400 };
+      }
+      const doc = await PendingDepositModel.findOne({ _id: pendingDepositId, userId: this.userId }).lean();
+      if (!doc) {
+        return { data: null, error: "Not found", message: "Pending deposit not found", status: 404 };
+      }
+      if (doc.status !== "pending") {
+        return {
+          data: null,
+          error: "Not cancellable",
+          message:
+            doc.status === "credited"
+              ? "Payment already received — this session cannot be cancelled."
+              : "This deposit is no longer active.",
+          status: 400,
+        };
+      }
+      if (doc.userCreditedAt) {
+        return {
+          data: null,
+          error: "Not cancellable",
+          message: "Payment already received — cannot cancel.",
+          status: 400,
+        };
+      }
+
+      const tokenAddr = doc.asset === "USDC" ? USDC_CONTRACT_ADDRESS : USDT_CONTRACT_ADDRESS;
+      const provider = new ethers.JsonRpcProvider(BSC_PROVIDER_URL, BSC_CHAIN_ID, { staticNetwork: true });
+      const erc20 = new ethers.Contract(tokenAddr, ["function balanceOf(address) view returns (uint256)"], provider);
+      const bal: bigint = await erc20.balanceOf(doc.ephemeralAddress);
+      if (bal > 0n) {
+        return {
+          data: null,
+          error: "Funds on address",
+          message:
+            "This address already holds tokens. Do not cancel — wait for confirmation. Closing the window will not stop processing.",
+          status: 409,
+        };
+      }
+
+      await PendingDepositModel.deleteOne({ _id: doc._id, userId: this.userId });
+      logger.info(`[Deposit] User ${this.userId} cancelled pending ${pendingDepositId} (no on-chain balance)`);
+      return {
+        data: { cancelled: true },
+        error: null,
+        message: "Deposit intent removed; monitoring stopped.",
+        status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: "Cancel failed", status: 500 };
     }
   }
 
