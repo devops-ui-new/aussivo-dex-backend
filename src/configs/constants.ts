@@ -1,5 +1,9 @@
+import path from 'path';
 import dotenv from 'dotenv';
-dotenv.config();
+import { ethers } from 'ethers';
+
+// Load project-root .env. `override: true` so values here win over empty vars in the shell/IDE (otherwise TREASURY_* can stay blank).
+dotenv.config({ path: path.resolve(process.cwd(), '.env'), override: true });
 
 export const PORT = process.env.PORT || '4000';
 export const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/aussivo-dex';
@@ -15,6 +19,31 @@ const _chain = parseInt(process.env.BSC_CHAIN_ID || '56', 10); // 56 mainnet, 97
 export const BSC_CHAIN_ID = Number.isFinite(_chain) && _chain > 0 ? _chain : 56;
 export const VAULT_CONTRACT_ADDRESS = process.env.VAULT_CONTRACT_ADDRESS || '';
 export const ADMIN_WALLET_PRIVATE_KEY = process.env.ADMIN_WALLET_PRIVATE_KEY || '';
+
+/** Ephemeral deposit wallets: encrypt private keys at rest (min 8 chars; use a long random string in prod). */
+export const EPHEMERAL_WALLET_SECRET = process.env.EPHEMERAL_WALLET_SECRET || 'dev-only-change-me';
+/** Strip quotes/BOM; checksum via ethers so validation matches what we send on-chain. */
+function resolveEvmAddress(raw: string | undefined): string {
+  const s = (raw ?? '')
+    .trim()
+    .replace(/^\uFEFF/, '')
+    .replace(/^["']+|["']+$/g, '');
+  if (!s || !/^0x[0-9a-fA-F]{40}$/i.test(s)) return '';
+  try {
+    return ethers.getAddress(s);
+  } catch {
+    try {
+      return ethers.getAddress(s.toLowerCase());
+    } catch {
+      return '';
+    }
+  }
+}
+
+/** Stablecoins swept here after detected on ephemeral address. */
+export const TREASURY_WALLET_ADDRESS = resolveEvmAddress(process.env.TREASURY_WALLET_ADDRESS);
+/** Optional: fund each ephemeral address with BNB so it can pay gas for the ERC-20 sweep. */
+export const GAS_FUNDER_PRIVATE_KEY = (process.env.GAS_FUNDER_PRIVATE_KEY || '').trim();
 export const USDT_CONTRACT_ADDRESS = process.env.USDT_CONTRACT_ADDRESS || '0x55d398326f99059fF775485246999027B3197955';
 export const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS || '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
 

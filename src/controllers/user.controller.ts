@@ -13,7 +13,9 @@ import OtpModel from "../models/otp.model";
 import ActivityModel from "../models/activity.model";
 import WithdrawRequestModel from "../models/withdrawRequest.model";
 import PendingDepositModel from "../models/pendingDeposit.model";
-import { JWT_SECRET, VAULT_CONTRACT_ADDRESS, USDT_CONTRACT_ADDRESS, USDC_CONTRACT_ADDRESS, BSC_CHAIN_ID } from "../configs/constants";
+import { JWT_SECRET, USDT_CONTRACT_ADDRESS, USDC_CONTRACT_ADDRESS, BSC_CHAIN_ID, EPHEMERAL_WALLET_SECRET } from "../configs/constants";
+import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/walletCrypto.helper";
+import { fundEphemeralGas } from "../services/ephemeralDepositSweep.service";
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
@@ -437,7 +439,7 @@ export default class UserController {
     }
   }
 
-  // ── DEPOSIT (with QR code generation) ──
+  // ── DEPOSIT (ephemeral address + QR; server sweeps to treasury after payment) ──
   async getDepositQR(body: {
     vaultId: string;
     amount: number;
@@ -474,19 +476,15 @@ export default class UserController {
           status: 400,
         };
 
-      // Deployed AussivoVault contract on BSC — users send USDT/USDC here.
-      // DepositListener watches for ERC-20 Transfer events to this address.
-      const depositAddress = VAULT_CONTRACT_ADDRESS;
-      if (!depositAddress) {
+      if (!EPHEMERAL_WALLET_SECRET || EPHEMERAL_WALLET_SECRET.length < 8) {
         return {
           data: null,
-          error: "Vault contract not configured",
-          message: "Vault contract address not set",
+          error: "Server misconfigured",
+          message: "Set EPHEMERAL_WALLET_SECRET (8+ chars) for deposit wallets",
           status: 500,
         };
       }
 
-      // BSC BEP-20 token contracts (USDT & USDC both use 18 decimals on BSC)
       const TOKEN_ADDRESSES: Record<string, string> = {
         USDT: USDT_CONTRACT_ADDRESS,
         USDC: USDC_CONTRACT_ADDRESS,
@@ -496,92 +494,73 @@ export default class UserController {
       const amountInBaseUnits = BigInt(Math.round(amount * 10 ** 6)) * BigInt(10 ** (decimals - 6));
       const requestId = `0x${randomBytes(32).toString("hex")}`;
 
-      const depositFunction =
-        vault.asset === "USDT" ? "depositUSDTWithRequest" : "depositUSDCWithRequest";
-      const iface = new ethers.Interface([
-        "function depositUSDTWithRequest(uint256 amount, string vaultId, bytes32 requestId)",
-        "function depositUSDCWithRequest(uint256 amount, string vaultId, bytes32 requestId)",
-      ]);
-      const txData = iface.encodeFunctionData(depositFunction, [
-        amountInBaseUnits,
-        vaultId,
-        requestId,
-      ]);
-      // Wallet scanner-safe QR (non-EIP-681): plain address.
-      const qrPayload = depositAddress;
-      const qrPayloadAddressOnly = depositAddress;
+      const ephemeral = ethers.Wallet.createRandom();
+      const ephemeralAddress = ephemeral.address.toLowerCase();
+      const privateKeyEncrypted = encryptPrivateKeyHex(ephemeral.privateKey, EPHEMERAL_WALLET_SECRET);
+      const privateKeyHash = hashPrivateKeyHexFingerprint(ephemeral.privateKey);
 
-      const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
-        width: 300,
-        margin: 2,
-        color: { dark: "#000000", light: "#ffffff" },
-      });
+      const INTENT_TTL_MS = 15 * 60 * 1000; // 15 minutes
+      const expiresAt = new Date(Date.now() + INTENT_TTL_MS);
 
-      // Per-vault routing: record a pending deposit intent so the listener
-      // credits the transfer to the vault the user actually chose.
-      const user = await UserModel.findById(this.userId);
-      const depositWallet = (
-        (body as any).walletAddress ||
-        user?.walletAddress ||
-        (user?.walletAddresses || [])[0] ||
-        ""
-      ).toLowerCase();
-      if (!depositWallet || !depositWallet.startsWith("0x")) {
-        return {
-          data: null,
-          error: "No wallet address",
-          message: "Connect a wallet before depositing",
-          status: 400,
-        };
-      }
-      const INTENT_TTL_MS = 60 * 60 * 1000; // 1 hour
-      await PendingDepositModel.create({
+      const pendingDoc = await PendingDepositModel.create({
         userId: this.userId,
         vaultId,
         expectedAmount: amount,
         expectedAmountBaseUnits: amountInBaseUnits.toString(),
         requestId,
         asset: vault.asset,
-        walletAddress: depositWallet,
-        expiresAt: new Date(Date.now() + INTENT_TTL_MS),
+        walletAddress: ephemeralAddress,
+        ephemeralAddress,
+        privateKeyEncrypted,
+        privateKeyHash,
+        expiresAt,
+      });
+
+      const gasFundTxHash = await fundEphemeralGas(ephemeralAddress);
+      if (gasFundTxHash) {
+        await PendingDepositModel.findByIdAndUpdate(pendingDoc._id, { gasFundTxHash });
+      }
+
+      // EIP-681: token contract @ chain + transfer(address,uint256) — wallets pre-fill recipient + amount.
+      const tokenChecksummed = ethers.getAddress(tokenAddress);
+      const recipientChecksummed = ethers.getAddress(ephemeral.address);
+      const qrPayload = `ethereum:${tokenChecksummed}@${BSC_CHAIN_ID}/transfer?address=${encodeURIComponent(
+        recipientChecksummed
+      )}&uint256=${amountInBaseUnits.toString()}`;
+      const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
+        width: 300,
+        margin: 2,
+        color: { dark: "#000000", light: "#ffffff" },
       });
 
       return {
         data: {
           qrCode: qrCodeDataUrl,
           qrPayload,
-          qrPayloadAddressOnly,
-          tx: {
-            to: depositAddress,
-            value: "0x0",
-            data: txData,
-            chainId: BSC_CHAIN_ID,
-            chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
-          },
-          depositAddress,
+          qrPayloadAddressOnly: ephemeral.address,
+          qrEip681: qrPayload,
+          depositAddress: ephemeral.address,
           tokenAddress,
           amount,
-          /** Exact on-chain uint256; wallet pay flow should use this to avoid float/parseUnit drift. */
           amountInBaseUnits: amountInBaseUnits.toString(),
           requestId,
-          vaultContractAddress: depositAddress,
-          depositFunction,
           asset: vault.asset,
           network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
           chainId: BSC_CHAIN_ID,
           chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
           vaultName: vault.name,
-          memo: `vault:${vaultId}:user:${this.userId}`,
+          expiresAt: expiresAt.toISOString(),
+          expiresInSeconds: Math.floor(INTENT_TTL_MS / 1000),
+          gasFundTxHash: gasFundTxHash || undefined,
           instructions: [
-            `Switch your wallet to ${BSC_CHAIN_ID === 56 ? "BNB Smart Chain (chainId 56 / 0x38)" : "BSC Testnet (chainId 97 / 0x61)"} BEFORE scanning`,
-            "QR is plain vault address for maximum scanner compatibility",
-            `Use in-app wallet button to sign ${depositFunction}(amount, vaultId, requestId)`,
-            `If ${vault.asset} isn't recognized, add it as a custom token first: ${tokenAddress}`,
-            "Confirm the transaction — deposit auto-confirms after on-chain confirmation",
+            `QR uses EIP-681: it should pre-fill ${vault.asset} (token contract), recipient (one-time address), and exact amount on chain ${BSC_CHAIN_ID}. You still confirm from your own wallet — "from" is whichever account you use to sign.`,
+            `Send exactly ${amount} ${vault.asset} within 15 minutes (expires ${expiresAt.toISOString()} server time).`,
+            "If your wallet does not support payment URLs, use “Copy address” and send the same amount manually.",
+            "After your transfer confirms on-chain, your vault balance is credited immediately; funds are then swept to our treasury (may take a short moment if gas is topping up).",
           ],
         },
         error: null,
-        message: "Deposit QR generated",
+        message: "Deposit address generated",
         status: 200,
       };
     } catch (err: any) {

@@ -10,6 +10,7 @@ import { bootstrapDB } from './utils/bootstrap.util';
 import { PORT, APY_CRON_SCHEDULE, ENVIRONMENT } from './configs/constants';
 import { distributeMonthlyAPY } from './helpers/apyDistribution.helper';
 import { depositListener } from './services/depositListener.service';
+import { startEphemeralDepositSweep } from './services/ephemeralDepositSweep.service';
 import Routes from './routes';
 import logger from './configs/logger.config';
 import { sendResponse } from './utils/response.util';
@@ -65,11 +66,12 @@ connectDB(async (mongooseConn) => {
   });
   logger.info(`[CRON] APY distribution scheduled: ${APY_CRON_SCHEDULE}`);
 
-  // ── On-chain Deposit Listener ──
+  // ── On-chain vault listener (optional when VAULT_CONTRACT_ADDRESS set) ──
   if (ENVIRONMENT !== 'test') {
     depositListener.start().catch(err => {
       logger.error('[DepositListener] Startup error:', err.message);
     });
+    startEphemeralDepositSweep();
   }
 
   // ── Start Server ──

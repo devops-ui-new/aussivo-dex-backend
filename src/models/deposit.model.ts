@@ -6,6 +6,8 @@ const DepositSchema = new Schema({
   amount: { type: Number, required: true },
   asset: { type: String, enum: ['USDT', 'USDC'], required: true },
   txHash: { type: String, default: '' },
+  /** Ephemeral-flow idempotency + link to update txHash after treasury sweep. */
+  pendingRequestId: { type: String, sparse: true, unique: true },
   walletAddress: { type: String, default: '' },
   lockUntil: { type: Date, default: null },
   apyPercent: { type: Number, required: true },
