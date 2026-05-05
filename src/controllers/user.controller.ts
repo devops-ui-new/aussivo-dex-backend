@@ -541,12 +541,8 @@ export default class UserController {
         await PendingDepositModel.findByIdAndUpdate(pendingDoc._id, { gasFundTxHash });
       }
 
-      // EIP-681: token contract @ chain + transfer(address,uint256) — wallets pre-fill recipient + amount.
-      const tokenChecksummed = ethers.getAddress(tokenAddress);
       const recipientChecksummed = ethers.getAddress(ephemeral.address);
-      const qrPayload = `ethereum:${tokenChecksummed}@${BSC_CHAIN_ID}/transfer?address=${encodeURIComponent(
-        recipientChecksummed
-      )}&uint256=${amountInBaseUnits.toString()}`;
+      const qrPayload = recipientChecksummed;
       const qrCodeDataUrl = await QRCode.toDataURL(qrPayload, {
         width: 300,
         margin: 2,
