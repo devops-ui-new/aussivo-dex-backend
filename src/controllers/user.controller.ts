@@ -174,9 +174,21 @@ export default class UserController {
           status: 400,
         };
 
+      let normalized: string;
+      try {
+        normalized = ethers.getAddress(walletAddress.trim()).toLowerCase();
+      } catch {
+        return {
+          data: null,
+          error: "Invalid wallet",
+          message: "Valid wallet address required",
+          status: 400,
+        };
+      }
+
       const user = await UserModel.findOne({
-        walletAddress: walletAddress.toLowerCase(),
         status: "active",
+        $or: [{ walletAddress: normalized }, { walletAddresses: normalized }],
       });
       if (!user) {
         return {
@@ -1000,12 +1012,24 @@ export default class UserController {
           status: 400,
         };
 
+      let normalized: string;
+      try {
+        normalized = ethers.getAddress(walletAddress.trim()).toLowerCase();
+      } catch {
+        return {
+          data: null,
+          error: "Invalid wallet",
+          message: "Valid wallet address required",
+          status: 400,
+        };
+      }
+
       const user = await UserModel.findOne({
-        walletAddress: walletAddress.toLowerCase(),
         status: "active",
+        $or: [{ walletAddress: normalized }, { walletAddresses: normalized }],
       });
       if (!user) {
-        // Not registered — frontend should show registration form
+        // Not registered — frontend should show email + OTP once
         return {
           data: { registered: false },
           error: null,
@@ -1022,7 +1046,7 @@ export default class UserController {
       );
 
       logger.info(
-        `[AUTH] Wallet auto-login: ${user.email} (${walletAddress.slice(0, 10)}...)`,
+        `[AUTH] Wallet auto-login: ${user.email} (${normalized.slice(0, 10)}...)`,
       );
 
       return {
@@ -1034,6 +1058,7 @@ export default class UserController {
             name: user.name,
             email: user.email,
             walletAddress: user.walletAddress,
+            walletAddresses: user.walletAddresses || [],
             referralCode: user.referralCode,
           },
         },
