@@ -19,6 +19,8 @@ RUN npm install --omit=dev
 
 COPY --from=builder /app/build ./build
 
+RUN mkdir -p /app/logs && chown -R node:node /app
+
 EXPOSE 4000
 
 USER node
