@@ -25,6 +25,9 @@ const ERC20_ABI = [
 
 const GAS_TOPUP_WEI = 350_000_000_000_000n;
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
+/** Many BSC RPCs reject `eth_getLogs` over wide ranges (-32005 limit exceeded). */
+const GETLOGS_CHUNK_BLOCKS = 1_000;
+const GETLOGS_MAX_BLOCK_SPAN = 6_000;
 
 const processing = new Set<string>();
 
@@ -107,23 +110,49 @@ async function findDepositorAddressesForWindow(params: {
   const toNorm = normalizeAddr(params.ephemeralAddress);
   if (!toNorm) return [];
 
-  const fromBlock = await blockAtOrAfterTimestamp(Math.max(0, Math.floor(params.fromMs / 1000)));
-  const toBlock = await blockAtOrAfterTimestamp(Math.max(0, Math.floor(params.toMs / 1000)));
+  const fromSec = Math.floor(Number(params.fromMs) / 1000);
+  const toSec = Math.floor(Number(params.toMs) / 1000);
+  if (!Number.isFinite(fromSec) || !Number.isFinite(toSec)) {
+    logger.warn("[EphemeralSweep] Depositor log window has invalid timestamps; skipping log scan");
+    return [];
+  }
+
+  let fromBlock = await blockAtOrAfterTimestamp(Math.max(0, fromSec));
+  const toBlock = await blockAtOrAfterTimestamp(Math.max(0, toSec));
   if (toBlock < fromBlock) return [];
 
-  const logs = await p.getLogs({
-    address: params.tokenAddress,
-    topics: [TRANSFER_TOPIC, null, topicAddress(toNorm)],
-    fromBlock,
-    toBlock,
-  });
+  const span = toBlock - fromBlock + 1;
+  if (span > GETLOGS_MAX_BLOCK_SPAN) {
+    logger.warn(
+      `[EphemeralSweep] Depositor log window spans ${span} blocks (${fromBlock}→${toBlock}); clamping to last ${GETLOGS_MAX_BLOCK_SPAN} blocks`
+    );
+    fromBlock = Math.max(1, toBlock - GETLOGS_MAX_BLOCK_SPAN + 1);
+  }
+
   const seen = new Set<string>();
-  for (const log of logs) {
-    const fromTopic = log.topics?.[1];
-    if (!fromTopic || fromTopic.length !== 66) continue;
-    const fromHex = `0x${fromTopic.slice(26)}`;
-    const fromNorm = normalizeAddr(fromHex);
-    if (fromNorm) seen.add(fromNorm);
+  const tokenAddr = ethers.getAddress(params.tokenAddress);
+  const topicTo = topicAddress(toNorm);
+
+  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += GETLOGS_CHUNK_BLOCKS) {
+    const chunkEnd = Math.min(chunkStart + GETLOGS_CHUNK_BLOCKS - 1, toBlock);
+    try {
+      const logs = await p.getLogs({
+        address: tokenAddr,
+        topics: [TRANSFER_TOPIC, null, topicTo],
+        fromBlock: chunkStart,
+        toBlock: chunkEnd,
+      });
+      for (const log of logs) {
+        const fromTopic = log.topics?.[1];
+        if (!fromTopic || fromTopic.length !== 66) continue;
+        const fromHex = `0x${fromTopic.slice(26)}`;
+        const fromNorm = normalizeAddr(fromHex);
+        if (fromNorm) seen.add(fromNorm);
+      }
+    } catch (e: any) {
+      const msg = e?.shortMessage || e?.message || String(e);
+      logger.warn(`[EphemeralSweep] getLogs chunk ${chunkStart}-${chunkEnd} failed: ${msg}`);
+    }
   }
   return [...seen];
 }
