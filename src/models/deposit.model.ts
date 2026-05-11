@@ -9,6 +9,8 @@ const DepositSchema = new Schema({
   /** Ephemeral-flow idempotency + link to update txHash after treasury sweep. */
   pendingRequestId: { type: String, sparse: true, unique: true },
   walletAddress: { type: String, default: '' },
+  /** Wallet(s) that sent on-chain funds for this deposit (audit). */
+  depositorAddresses: { type: [String], default: [] },
   lockUntil: { type: Date, default: null },
   apyPercent: { type: Number, required: true },
   tierIndex: { type: Number, default: 0 },

@@ -12,6 +12,8 @@ const PendingDepositSchema = new Schema(
     walletAddress: { type: String, default: "", lowercase: true, index: true },
     /** One-time deposit address (QR); funds swept to treasury after detection. */
     ephemeralAddress: { type: String, required: true, lowercase: true, index: true },
+    /** Wallets observed sending token transfers to the ephemeral address (audit trail). */
+    depositorAddresses: { type: [String], default: [] },
     /** AES-GCM ciphertext (base64). Removed after successful treasury sweep. */
     privateKeyEncrypted: { type: String, required: false, default: "" },
     /** SHA-256 hex fingerprint of the private key (audit only; not reversible). Kept after sweep. */
@@ -28,6 +30,11 @@ const PendingDepositSchema = new Schema(
       index: true,
     },
     expiresAt: { type: Date, required: true, index: true },
+    /** First time user dismissed QR/cancelled from UI. Tracking still continues until expiry. */
+    userDismissedAt: { type: Date, default: null },
+    /** Actual token amount detected on ephemeral wallet after expiry window. */
+    receivedAmount: { type: Number, default: 0 },
+    receivedAmountBaseUnits: { type: String, default: "" },
     /** Set when stablecoin balance is sufficient and user/vault accounting has been applied. */
     userCreditedAt: { type: Date, default: null },
     /** Treasury sweep tx (funds moved off ephemeral). */

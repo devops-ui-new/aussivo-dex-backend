@@ -5,6 +5,7 @@ import {
   EPHEMERAL_WALLET_SECRET,
   GAS_FUNDER_PRIVATE_KEY,
   TREASURY_WALLET_ADDRESS,
+  getCanonicalBscStableDecimals,
   USDT_CONTRACT_ADDRESS,
   USDC_CONTRACT_ADDRESS,
 } from "../configs/constants";
@@ -23,6 +24,7 @@ const ERC20_ABI = [
 ];
 
 const GAS_TOPUP_WEI = 350_000_000_000_000n;
+const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 
 const processing = new Set<string>();
 
@@ -62,17 +64,78 @@ function tokenAddressForAsset(asset: string): string {
   return USDT_CONTRACT_ADDRESS;
 }
 
-function hasReceivedEnough(bal: bigint, expected: bigint): boolean {
-  if (expected <= 0n) return false;
-  if (bal >= expected) return true;
-  return bal * 10000n >= expected * 9999n;
+function normalizeAddr(addr: string): string {
+  try {
+    return ethers.getAddress(addr).toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function topicAddress(addr: string): string {
+  return `0x000000000000000000000000${addr.toLowerCase().replace(/^0x/, "")}`;
+}
+
+async function blockAtOrAfterTimestamp(tsSec: number): Promise<number> {
+  const p = getProvider();
+  const latest = await p.getBlock("latest");
+  if (!latest) return 0;
+  let lo = 1;
+  let hi = latest.number;
+  let ans = latest.number;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const b = await p.getBlock(mid);
+    if (!b) break;
+    if (b.timestamp >= tsSec) {
+      ans = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return ans;
+}
+
+async function findDepositorAddressesForWindow(params: {
+  tokenAddress: string;
+  ephemeralAddress: string;
+  fromMs: number;
+  toMs: number;
+}): Promise<string[]> {
+  const p = getProvider();
+  const toNorm = normalizeAddr(params.ephemeralAddress);
+  if (!toNorm) return [];
+
+  const fromBlock = await blockAtOrAfterTimestamp(Math.max(0, Math.floor(params.fromMs / 1000)));
+  const toBlock = await blockAtOrAfterTimestamp(Math.max(0, Math.floor(params.toMs / 1000)));
+  if (toBlock < fromBlock) return [];
+
+  const logs = await p.getLogs({
+    address: params.tokenAddress,
+    topics: [TRANSFER_TOPIC, null, topicAddress(toNorm)],
+    fromBlock,
+    toBlock,
+  });
+  const seen = new Set<string>();
+  for (const log of logs) {
+    const fromTopic = log.topics?.[1];
+    if (!fromTopic || fromTopic.length !== 66) continue;
+    const fromHex = `0x${fromTopic.slice(26)}`;
+    const fromNorm = normalizeAddr(fromHex);
+    if (fromNorm) seen.add(fromNorm);
+  }
+  return [...seen];
 }
 
 /**
  * Credit user + vault as soon as USDT is on the ephemeral address (before treasury sweep).
  * Idempotent via unique `pendingRequestId` on deposits.
  */
-async function applyDepositAccounting(pending: { _id: any; userId: any; vaultId: any; expectedAmount: number; asset: string; requestId: string; ephemeralAddress?: string }): Promise<void> {
+async function applyDepositAccounting(
+  pending: { _id: any; userId: any; vaultId: any; expectedAmount: number; asset: string; requestId: string; ephemeralAddress?: string },
+  opts?: { settledAmount?: number; depositorAddresses?: string[] }
+): Promise<void> {
   const dup = await DepositModel.findOne({ pendingRequestId: pending.requestId });
   if (dup) return;
 
@@ -85,8 +148,9 @@ async function applyDepositAccounting(pending: { _id: any; userId: any; vaultId:
     throw new Error(`No vault ${pending.vaultId}`);
   }
 
-  const amount = pending.expectedAmount;
+  const amount = Number(opts?.settledAmount ?? pending.expectedAmount);
   const symbol = pending.asset;
+  const depositorAddresses = (opts?.depositorAddresses || []).map((a) => normalizeAddr(a)).filter(Boolean);
 
   let tierIndex = 0;
   let apyPercent = vault.tiers[0]?.apyPercent || 0;
@@ -110,7 +174,8 @@ async function applyDepositAccounting(pending: { _id: any; userId: any; vaultId:
       asset: symbol,
       txHash: recordHash,
       pendingRequestId: pending.requestId,
-      walletAddress: String(pending.ephemeralAddress || "").toLowerCase(),
+      walletAddress: depositorAddresses[0] || String(pending.ephemeralAddress || "").toLowerCase(),
+      depositorAddresses,
       lockUntil,
       apyPercent,
       tierIndex,
@@ -131,6 +196,27 @@ async function applyDepositAccounting(pending: { _id: any; userId: any; vaultId:
     $inc: { [balField]: amount, totalDeposited: amount },
   });
 
+  if (depositorAddresses.length) {
+    const known = (user.walletAddresses || []).map((w: string) => normalizeAddr(w)).filter(Boolean);
+    const uniqueIncoming = depositorAddresses.filter((a) => !known.includes(a));
+    if (uniqueIncoming.length) {
+      const available: string[] = [];
+      for (const addr of uniqueIncoming) {
+        const conflict = await UserModel.findOne({
+          _id: { $ne: user._id },
+          $or: [{ walletAddress: addr }, { walletAddresses: addr }],
+        }).select("_id");
+        if (!conflict) available.push(addr);
+      }
+      if (available.length) {
+        await UserModel.findByIdAndUpdate(user._id, {
+          $addToSet: { walletAddresses: { $each: available } },
+          ...(user.walletAddress ? {} : { $set: { walletAddress: available[0] } }),
+        });
+      }
+    }
+  }
+
   await ActivityModel.create({
     userId: user._id,
     title: "Deposit Confirmed",
@@ -142,6 +228,7 @@ async function applyDepositAccounting(pending: { _id: any; userId: any; vaultId:
       amount,
       txHash: recordHash,
       pendingRequestId: pending.requestId,
+      depositorAddresses,
     },
   });
 
@@ -180,37 +267,59 @@ async function sweepOne(pendingArg: any): Promise<void> {
     const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, p);
     const ephemeral = String(doc.ephemeralAddress).toLowerCase();
     let bal: bigint = await erc20.balanceOf(ephemeral);
-    const expected = BigInt(String(doc.expectedAmountBaseUnits));
-    const paidEnough = hasReceivedEnough(bal, expected);
+    const expected = BigInt(String(doc.expectedAmountBaseUnits || "0"));
+    const nowMs = Date.now();
+    const expiresMs = new Date(doc.expiresAt).getTime();
+    const isWindowOpen = nowMs < expiresMs;
 
-    if (!paidEnough) {
-      const now = Date.now();
-      if (
-        doc.status === "pending" &&
-        !doc.userCreditedAt &&
-        new Date(doc.expiresAt).getTime() < now &&
-        bal === 0n &&
-        !doc.sweepTxHash
-      ) {
-        await PendingDepositModel.findByIdAndUpdate(doc._id, { status: "expired" });
-        logger.info(`[EphemeralSweep] Expired empty intent ${doc.requestId}`);
-      } else if (bal > 0n && !paidEnough) {
-        logger.warn(
-          `[EphemeralSweep] Underpaid ${ephemeral}: balance=${bal.toString()} expected=${expected.toString()} asset=${doc.asset} token=${tokenAddr} chain=${BSC_CHAIN_ID}`
+    if (isWindowOpen) {
+      if (bal > 0n) {
+        logger.info(
+          `[EphemeralSweep] Tracking ${ephemeral}: currentBalance=${bal.toString()} expected=${expected.toString()} until=${new Date(expiresMs).toISOString()}`
         );
       }
       return;
     }
 
+    if (bal === 0n) {
+      if (doc.status === "pending" && !doc.userCreditedAt && !doc.sweepTxHash) {
+        await PendingDepositModel.findByIdAndUpdate(doc._id, { status: "expired" });
+        logger.info(`[EphemeralSweep] Expired empty intent ${doc.requestId}`);
+      }
+      return;
+    }
+
+    const decimals = getCanonicalBscStableDecimals(tokenAddr) ?? 18;
+    const settledAmount = Number(ethers.formatUnits(bal, decimals));
+    const depositorAddresses = await findDepositorAddressesForWindow({
+      tokenAddress: tokenAddr,
+      ephemeralAddress: ephemeral,
+      fromMs: Math.max(0, new Date(doc.createdAt).getTime() - 60_000),
+      toMs: expiresMs + 60_000,
+    });
+
     if (!doc.userCreditedAt) {
       const transitioned = await PendingDepositModel.findOneAndUpdate(
         { _id: doc._id, userCreditedAt: null, status: "pending" },
-        { $set: { userCreditedAt: new Date(), status: "credited" } },
+        {
+          $set: {
+            userCreditedAt: new Date(),
+            status: "credited",
+            expectedAmount: settledAmount,
+            expectedAmountBaseUnits: bal.toString(),
+            receivedAmount: settledAmount,
+            receivedAmountBaseUnits: bal.toString(),
+            depositorAddresses,
+          },
+        },
         { new: true }
       );
       if (transitioned) {
         try {
-          await applyDepositAccounting(doc as any);
+          await applyDepositAccounting(doc as any, {
+            settledAmount,
+            depositorAddresses,
+          });
         } catch (err: any) {
           logger.error(`[EphemeralSweep] Credit accounting failed ${doc._id}: ${err?.message || err}`);
           await PendingDepositModel.findByIdAndUpdate(doc._id, {
@@ -219,6 +328,18 @@ async function sweepOne(pendingArg: any): Promise<void> {
           return;
         }
       }
+    } else if (depositorAddresses.length) {
+      await PendingDepositModel.findByIdAndUpdate(doc._id, {
+        $set: { receivedAmount: settledAmount, receivedAmountBaseUnits: bal.toString() },
+        $addToSet: { depositorAddresses: { $each: depositorAddresses } },
+      });
+      await DepositModel.findOneAndUpdate(
+        { pendingRequestId: doc.requestId },
+        {
+          $set: { amount: settledAmount },
+          $addToSet: { depositorAddresses: { $each: depositorAddresses } },
+        }
+      );
     }
 
     const latest = await PendingDepositModel.findById(doc._id).lean();
@@ -262,12 +383,12 @@ async function sweepOne(pendingArg: any): Promise<void> {
     }
 
     bal = await erc20.balanceOf(ephemeral);
-    if (!hasReceivedEnough(bal, expected)) {
+    if (bal === 0n) {
       return;
     }
 
     logger.info(
-      `[EphemeralSweep] Sweeping ${bal.toString()} wei ${latest.asset} from ${ephemeral} → treasury (expected=${expected.toString()})`
+      `[EphemeralSweep] Sweeping ${bal.toString()} wei ${latest.asset} from ${ephemeral} → treasury (settled=${bal.toString()})`
     );
 
     const tx = await erc20Write.transfer(TREASURY_WALLET_ADDRESS, bal, { gasLimit: 150_000n });

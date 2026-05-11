@@ -143,7 +143,7 @@ export default class AdminController {
       if (status) query.status = status;
       const skip = (page - 1) * limit;
       const [deposits, total] = await Promise.all([
-        DepositModel.find(query).populate('userId', 'name email walletAddress').populate('vaultId', 'name asset').sort({ createdAt: -1 }).skip(skip).limit(limit),
+        DepositModel.find(query).populate('userId', 'name email walletAddress walletAddresses').populate('vaultId', 'name asset').sort({ createdAt: -1 }).skip(skip).limit(limit),
         DepositModel.countDocuments(query),
       ]);
       return { data: { deposits, total, page, limit }, error: null, message: 'All deposits', status: 200 };

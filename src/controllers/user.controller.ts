@@ -615,8 +615,8 @@ export default class UserController {
   }
 
   /**
-   * User closed the deposit modal without completing payment — delete intent and key material
-   * only if no tokens have arrived yet (on-chain balance 0) and user has not been credited.
+   * User closed the deposit modal. Keep tracking this one-time address until expiry;
+   * UI close should not stop backend monitoring.
    */
   async cancelPendingDeposit(body: { pendingDepositId?: string }): Promise<IResponse> {
     try {
@@ -648,26 +648,14 @@ export default class UserController {
         };
       }
 
-      const tokenAddr = doc.asset === "USDC" ? USDC_CONTRACT_ADDRESS : USDT_CONTRACT_ADDRESS;
-      const provider = new ethers.JsonRpcProvider(BSC_PROVIDER_URL, BSC_CHAIN_ID, { staticNetwork: true });
-      const erc20 = new ethers.Contract(tokenAddr, ["function balanceOf(address) view returns (uint256)"], provider);
-      const bal: bigint = await erc20.balanceOf(doc.ephemeralAddress);
-      if (bal > 0n) {
-        return {
-          data: null,
-          error: "Funds on address",
-          message:
-            "This address already holds tokens. Do not cancel — wait for confirmation. Closing the window will not stop processing.",
-          status: 409,
-        };
-      }
-
-      await PendingDepositModel.deleteOne({ _id: doc._id, userId: this.userId });
-      logger.info(`[Deposit] User ${this.userId} cancelled pending ${pendingDepositId} (no on-chain balance)`);
+      await PendingDepositModel.findByIdAndUpdate(doc._id, {
+        $set: { userDismissedAt: new Date() },
+      });
+      logger.info(`[Deposit] User ${this.userId} dismissed pending ${pendingDepositId}; tracking continues until expiry.`);
       return {
-        data: { cancelled: true },
+        data: { cancelled: true, trackingContinues: true, expiresAt: doc.expiresAt },
         error: null,
-        message: "Deposit intent removed; monitoring stopped.",
+        message: "Deposit window closed in UI. We will keep tracking this address until it expires.",
         status: 200,
       };
     } catch (err: any) {
@@ -724,6 +712,7 @@ export default class UserController {
         asset: vault.asset,
         txHash: txHash || "",
         walletAddress: user.walletAddress,
+        depositorAddresses: user.walletAddress ? [user.walletAddress] : [],
         lockUntil,
         apyPercent,
         tierIndex,

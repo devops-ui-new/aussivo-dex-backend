@@ -188,6 +188,7 @@ export class DepositListenerService {
               asset: symbol,
               txHash,
               walletAddress: depositor,
+              depositorAddresses: [depositor],
               lockUntil,
               apyPercent,
               tierIndex,
