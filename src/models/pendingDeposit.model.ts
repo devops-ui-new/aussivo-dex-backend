@@ -37,6 +37,10 @@ const PendingDepositSchema = new Schema(
     receivedAmountBaseUnits: { type: String, default: "" },
     /** Set when stablecoin balance is sufficient and user/vault accounting has been applied. */
     userCreditedAt: { type: Date, default: null },
+    /** First tick we saw token on the ephemeral wallet during the intent window; used to send “incoming” email once. */
+    incomingFundsNotifiedAt: { type: Date, default: null },
+    /** Last on-chain balance (base units) we emailed about; used to detect new transfers during the window. */
+    incomingFundsLastNotifiedBalanceBaseUnits: { type: String, default: "" },
     /** Treasury sweep tx (funds moved off ephemeral). */
     matchedTxHash: { type: String, default: "" },
     matchedAt: { type: Date, default: null },

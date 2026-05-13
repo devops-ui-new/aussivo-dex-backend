@@ -163,7 +163,7 @@ async function findDepositorAddressesForWindow(params: {
  */
 async function applyDepositAccounting(
   pending: { _id: any; userId: any; vaultId: any; expectedAmount: number; asset: string; requestId: string; ephemeralAddress?: string },
-  opts?: { settledAmount?: number; depositorAddresses?: string[] }
+  opts?: { settledAmount?: number; depositorAddresses?: string[]; skipConfirmationEmail?: boolean }
 ): Promise<void> {
   const dup = await DepositModel.findOne({ pendingRequestId: pending.requestId });
   if (dup) return;
@@ -262,24 +262,186 @@ async function applyDepositAccounting(
   });
 
   const monthlyYield = ((amount * apyPercent) / 100).toFixed(2);
-  try {
-    await sendEmail(user.email, "✅ Deposit Confirmed — Aussivo.DEX", "deposit-confirmation", {
-      name: user.name,
-      amount: amount.toFixed(2),
-      asset: symbol,
-      vaultName: vault.name,
-      apyPercent: apyPercent.toFixed(1),
-      monthlyYield,
-      lockDays: vault.lockDays,
-      txHash: recordHash,
-      txHashShort: "Sweep pending — check Portfolio",
-      date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
-    });
-  } catch (e: any) {
-    logger.warn(`[EphemeralSweep] Email failed: ${e?.message}`);
+  if (!opts?.skipConfirmationEmail) {
+    try {
+      await sendEmail(user.email, "✅ Deposit Confirmed — Aussivo.DEX", "deposit-confirmation", {
+        name: user.name,
+        amount: amount.toFixed(2),
+        asset: symbol,
+        vaultName: vault.name,
+        apyPercent: apyPercent.toFixed(1),
+        monthlyYield,
+        lockDays: vault.lockDays,
+        txHash: recordHash,
+        txHashShort: "Sweep pending — check Portfolio",
+        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
+      });
+    } catch (e: any) {
+      logger.warn(`[EphemeralSweep] Email failed: ${e?.message}`);
+    }
+  } else {
+    logger.info(`[EphemeralSweep] Skipping deposit-confirmation email (partial vs intent) for ${user.email}`);
   }
 
   logger.info(`[EphemeralSweep] Credited user ${user.email} ${amount} ${symbol} (requestId=${pending.requestId.slice(0, 10)}…)`);
+}
+
+function tierApyForDepositAmount(amount: number, vault: { tiers?: { minAmount: number; apyPercent: number }[] }): number {
+  const tiers = vault.tiers || [];
+  let apyPercent = tiers[0]?.apyPercent || 0;
+  for (let i = tiers.length - 1; i >= 0; i--) {
+    if (amount >= tiers[i].minAmount) {
+      apyPercent = tiers[i].apyPercent;
+      break;
+    }
+  }
+  return apyPercent;
+}
+
+async function revertIncomingFundsWatermark(id: unknown, prevStrForRevert: string): Promise<void> {
+  if (!prevStrForRevert) {
+    await PendingDepositModel.findByIdAndUpdate(id, {
+      $set: { incomingFundsLastNotifiedBalanceBaseUnits: "" },
+      $unset: { incomingFundsNotifiedAt: 1 },
+    });
+  } else {
+    await PendingDepositModel.findByIdAndUpdate(id, {
+      $set: { incomingFundsLastNotifiedBalanceBaseUnits: prevStrForRevert },
+    });
+  }
+}
+
+/**
+ * During the deposit window: use deposit-confirmation for partial transfers, full amount on-chain, etc. (single template).
+ */
+async function tryNotifyIncomingFundsDuringWindow(
+  doc: any,
+  bal: bigint,
+  expectedBn: bigint,
+  tokenAddr: string
+): Promise<void> {
+  const lastStr = String(doc.incomingFundsLastNotifiedBalanceBaseUnits ?? "").trim();
+  // Migration: older rows only had incomingFundsNotifiedAt — advance watermark without re-mailing.
+  if (!lastStr && doc.incomingFundsNotifiedAt) {
+    await PendingDepositModel.updateOne({ _id: doc._id }, { $set: { incomingFundsLastNotifiedBalanceBaseUnits: bal.toString() } });
+    return;
+  }
+
+  let prev: bigint | null = null;
+  try {
+    if (lastStr) prev = BigInt(lastStr);
+  } catch {
+    prev = null;
+  }
+
+  if (prev !== null && bal <= prev) return;
+
+  // Already notified at/above expected; further top-ups do not get another email.
+  if (prev !== null && prev >= expectedBn && bal >= prev) {
+    if (bal > prev) {
+      await PendingDepositModel.findByIdAndUpdate(doc._id, {
+        $set: { incomingFundsLastNotifiedBalanceBaseUnits: bal.toString() },
+      });
+    }
+    return;
+  }
+
+  const filter: Record<string, unknown> = {
+    _id: doc._id,
+    status: "pending",
+  };
+  if (prev === null) {
+    filter.$or = [
+      { incomingFundsLastNotifiedBalanceBaseUnits: { $exists: false } },
+      { incomingFundsLastNotifiedBalanceBaseUnits: null },
+      { incomingFundsLastNotifiedBalanceBaseUnits: "" },
+    ];
+  } else {
+    filter.incomingFundsLastNotifiedBalanceBaseUnits = prev.toString();
+  }
+
+  const prevStrForRevert = prev === null ? "" : prev.toString();
+
+  const claimed = await PendingDepositModel.findOneAndUpdate(filter as any, {
+    $set: {
+      incomingFundsLastNotifiedBalanceBaseUnits: bal.toString(),
+      incomingFundsNotifiedAt: new Date(),
+    },
+  }).lean();
+  if (!claimed) return;
+
+  const user = await UserModel.findById(doc.userId).lean();
+  const vault = await VaultModel.findById(doc.vaultId).lean();
+  if (!user?.email || !vault) {
+    await revertIncomingFundsWatermark(doc._id, prevStrForRevert);
+    return;
+  }
+
+  const decimals = getCanonicalBscStableDecimals(tokenAddr) ?? 18;
+  const prevBn = prev === null ? 0n : prev;
+  const incrementBn = bal - prevBn;
+  if (incrementBn <= 0n) {
+    await revertIncomingFundsWatermark(doc._id, prevStrForRevert);
+    return;
+  }
+
+  const cumulativeNum = Number(ethers.formatUnits(bal, decimals));
+  const incrementNum = Number(ethers.formatUnits(incrementBn, decimals));
+  const incrementFormatted = incrementNum.toFixed(2);
+  const receivedAmount = parseFloat(ethers.formatUnits(bal, decimals)).toFixed(2);
+  const expectedAmount = parseFloat(ethers.formatUnits(expectedBn, decimals)).toFixed(2);
+
+  const vaultName = (vault as { name?: string }).name || "Vault";
+  const apyPercent = tierApyForDepositAmount(cumulativeNum, vault as any);
+  const monthlyYield = ((incrementNum * apyPercent) / 100).toFixed(2);
+  const expiresAtFormatted = new Date(doc.expiresAt).toLocaleString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  });
+
+  try {
+    if (bal < expectedBn) {
+      const subject = prev === null ? "Funds received — Aussivo.DEX" : "Additional funds received — Aussivo.DEX";
+      const ok = await sendEmail(user.email, subject, "deposit-confirmation", {
+        incomingPartial: true,
+        isAdditionalTransfer: prev !== null,
+        name: user.name || "",
+        amount: incrementFormatted,
+        asset: doc.asset,
+        vaultName,
+        apyPercent: apyPercent.toFixed(1),
+        monthlyYield,
+        lockDays: (vault as any).lockDays,
+        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
+      });
+      if (!ok) throw new Error("email not sent (SMTP disabled or send failed)");
+      logger.info(`[EphemeralSweep] Partial window email (${subject}) → ${user.email} increment=${incrementFormatted}`);
+    } else {
+      const monthlyYieldFull = ((cumulativeNum * apyPercent) / 100).toFixed(2);
+      const ok = await sendEmail(user.email, "Incoming transfer detected — Aussivo.DEX", "deposit-confirmation", {
+        incomingFullWindow: true,
+        name: user.name || "",
+        amount: receivedAmount,
+        expectedAmount,
+        asset: doc.asset,
+        vaultName,
+        apyPercent: apyPercent.toFixed(1),
+        monthlyYield: monthlyYieldFull,
+        lockDays: (vault as any).lockDays,
+        expiresAtFormatted,
+        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
+      });
+      if (!ok) throw new Error("email not sent (SMTP disabled or send failed)");
+      logger.info(`[EphemeralSweep] Full expected amount on-chain — deposit-confirmation → ${user.email}`);
+    }
+  } catch (e: any) {
+    await revertIncomingFundsWatermark(doc._id, prevStrForRevert);
+    logger.warn(`[EphemeralSweep] Incoming window email failed for ${doc._id}: ${e?.message || e}`);
+  }
 }
 
 async function sweepOne(pendingArg: any): Promise<void> {
@@ -303,6 +465,7 @@ async function sweepOne(pendingArg: any): Promise<void> {
 
     if (isWindowOpen) {
       if (bal > 0n) {
+        await tryNotifyIncomingFundsDuringWindow(doc, bal, expected, tokenAddr);
         logger.info(
           `[EphemeralSweep] Tracking ${ephemeral}: currentBalance=${bal.toString()} expected=${expected.toString()} until=${new Date(expiresMs).toISOString()}`
         );
@@ -345,9 +508,11 @@ async function sweepOne(pendingArg: any): Promise<void> {
       );
       if (transitioned) {
         try {
+          const skipConfirmationEmail = bal < expected;
           await applyDepositAccounting(doc as any, {
             settledAmount,
             depositorAddresses,
+            skipConfirmationEmail,
           });
         } catch (err: any) {
           logger.error(`[EphemeralSweep] Credit accounting failed ${doc._id}: ${err?.message || err}`);
