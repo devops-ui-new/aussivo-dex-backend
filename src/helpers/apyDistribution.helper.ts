@@ -50,7 +50,7 @@ export const distributeMonthlyAPY = async () => {
         }
 
         // Calculate monthly yield
-        const monthlyYield = (deposit.amount * deposit.apyPercent) / 100;
+        const monthlyYield = (deposit.amount * ((deposit.apyPercent)/12)) / 100;
         if (monthlyYield <= 0) continue;
 
         const user = await UserModel.findById(deposit.userId);

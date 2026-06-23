@@ -216,7 +216,7 @@ export class DepositListenerService {
             });
 
             // Send deposit confirmation email
-            const monthlyYield = (amount * apyPercent / 100).toFixed(2);
+            const monthlyYield = ((amount * (apyPercent)/12) / 100).toFixed(2);
             await sendEmail(user.email, '✅ Deposit Confirmed — Aussivo.DEX', 'deposit-confirmation', {
               name: user.name,
               amount: amount.toFixed(2),
