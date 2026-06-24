@@ -29,71 +29,89 @@ export const distributeMonthlyAPY = async () => {
 
     for (const deposit of activeDeposits) {
       try {
-        // Check if already paid this month
-        const lastYield = await YieldLogModel.findOne({
-          depositId: deposit._id,
-          source: 'vault_apy',
-        }).sort({ createdAt: -1 });
+        // ── 30-DAY ROLLING CYCLES (per deposit, anchored on its own start date) ──
+        // Yield is credited once for every full 30 days the deposit has been active,
+        // measured from `createdAt` (NOT calendar months). This is drift-free and
+        // catch-up safe: the number paid is always derived from elapsed time vs the
+        // number already paid, so a missed/duplicate cron run can never over- or
+        // under-pay. The live per-hour figure shown in the UI is only an estimate;
+        // the withdrawable balance steps up here, every 30 days.
+        const CYCLE_MS = 30 * 24 * 60 * 60 * 1000; // one 30-day cycle
+        const createdMs = new Date(deposit.createdAt as any).getTime();
+        const elapsedMs = Date.now() - createdMs;
 
-        if (lastYield) {
-          const daysSinceLast = (Date.now() - lastYield.createdAt.getTime()) / (1000 * 60 * 60 * 24);
-          if (daysSinceLast < 25) { // buffer: at least 25 days between payments
-            continue;
+        // Whole 30-day cycles earned so far, capped at the deposit's term.
+        const cyclesEarned = Math.min(
+          Math.floor(elapsedMs / CYCLE_MS),
+          deposit.maxYieldPayments
+        );
+        const alreadyPaid = deposit.yieldPaymentsCount || 0;
+        const cyclesToPay = cyclesEarned - alreadyPaid;
+
+        if (cyclesToPay <= 0) {
+          // Nothing new is due yet. Mark matured once the full term has been paid.
+          if (alreadyPaid >= deposit.maxYieldPayments) {
+            await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
+            logger.info(`[APY-CRON] Deposit ${deposit._id} matured after ${alreadyPaid} payments`);
           }
-        }
-
-        // Check if max payments reached
-        if (deposit.yieldPaymentsCount >= deposit.maxYieldPayments) {
-          await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
-          logger.info(`[APY-CRON] Deposit ${deposit._id} matured after ${deposit.yieldPaymentsCount} payments`);
           continue;
         }
 
-        // Calculate monthly yield
-        const monthlyYield = (deposit.amount * deposit.apyPercent) / 100;
+        // apyPercent is the ANNUAL APY %. Each 30-day cycle pays principal * (annual / 12) / 100.
+        const monthlyYield = (deposit.amount * (deposit.apyPercent / 12)) / 100;
         if (monthlyYield <= 0) continue;
 
         const user = await UserModel.findById(deposit.userId);
         if (!user || user.status !== 'active') continue;
 
-        // Credit yield to user's yield wallet
         const yieldField = deposit.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
-        await UserModel.findByIdAndUpdate(user._id, {
-          $inc: { [yieldField]: monthlyYield }
-        });
 
-        // Log yield payment
-        await YieldLogModel.create({
-          userId: user._id,
-          depositId: deposit._id,
-          vaultId: vault._id,
-          amount: monthlyYield,
-          asset: deposit.asset,
-          apyPercent: deposit.apyPercent,
-          depositAmount: deposit.amount,
-          paymentNumber: deposit.yieldPaymentsCount + 1,
-          source: 'vault_apy',
-        });
+        // Credit each completed 30-day cycle since the last payout (normally 1;
+        // only > 1 if the cron was offline across multiple cycles).
+        for (let k = 1; k <= cyclesToPay; k++) {
+          const paymentNumber = alreadyPaid + k;
 
-        // Update deposit
+          await UserModel.findByIdAndUpdate(user._id, {
+            $inc: { [yieldField]: monthlyYield }
+          });
+
+          await YieldLogModel.create({
+            userId: user._id,
+            depositId: deposit._id,
+            vaultId: vault._id,
+            amount: monthlyYield,
+            asset: deposit.asset,
+            apyPercent: deposit.apyPercent,
+            depositAmount: deposit.amount,
+            paymentNumber,
+            source: 'vault_apy',
+          });
+
+          await ActivityModel.create({
+            userId: user._id,
+            title: 'APY Yield Credited',
+            description: `$${monthlyYield.toFixed(2)} ${deposit.asset} yield from ${vault.name} (30-day cycle ${paymentNumber}/${deposit.maxYieldPayments})`,
+            type: 'yield',
+            metadata: { vaultId: vault._id, depositId: deposit._id, amount: monthlyYield, paymentNumber }
+          });
+
+          totalDistributed += monthlyYield;
+
+          // Referral commissions on each cycle's yield (L1 0.35%, L2 0.15% of yield).
+          await distributeReferralCommissions(user._id, monthlyYield, deposit.asset, deposit._id, vault._id);
+        }
+
+        // Advance the deposit's paid-cycle counter once for the whole batch.
         await DepositModel.findByIdAndUpdate(deposit._id, {
-          $inc: { totalYieldPaid: monthlyYield, yieldPaymentsCount: 1 }
+          $inc: { totalYieldPaid: monthlyYield * cyclesToPay, yieldPaymentsCount: cyclesToPay }
         });
 
-        // Activity log
-        await ActivityModel.create({
-          userId: user._id,
-          title: 'APY Yield Credited',
-          description: `$${monthlyYield.toFixed(2)} ${deposit.asset} yield from ${vault.name}`,
-          type: 'yield',
-          metadata: { vaultId: vault._id, depositId: deposit._id, amount: monthlyYield }
-        });
-
-        totalDistributed += monthlyYield;
         usersProcessed++;
 
-        // ── REFERRAL COMMISSIONS ──
-        await distributeReferralCommissions(user._id, monthlyYield, deposit.asset, deposit._id, vault._id);
+        if (alreadyPaid + cyclesToPay >= deposit.maxYieldPayments) {
+          await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
+          logger.info(`[APY-CRON] Deposit ${deposit._id} matured after ${alreadyPaid + cyclesToPay} payments`);
+        }
 
       } catch (err: any) {
         errors++;

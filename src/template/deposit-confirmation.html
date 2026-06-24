@@ -39,7 +39,7 @@ body{margin:0;padding:0;background:#0a0f1a;font-family:'Segoe UI',Arial,sans-ser
 <div style="margin:20px 0">
 {{#if incomingFullWindow}}<div class="detail-row"><span class="detail-label">Vault</span><span class="detail-value">{{vaultName}}</span></div>
 <div class="detail-row"><span class="detail-label">Deposit window ends</span><span class="detail-value">{{expiresAtFormatted}}</span></div>{{/if}}
-<div class="detail-row"><span class="detail-label">APY Rate</span><span class="detail-value">{{apyPercent}}% monthly</span></div>
+<div class="detail-row"><span class="detail-label">APY Rate</span><span class="detail-value">{{apyPercent}}% APY ({{apyMonthly}}% monthly)</span></div>
 <div class="detail-row"><span class="detail-label">Est. Monthly Yield</span><span class="detail-value">${{monthlyYield}} {{asset}}</span></div>
 <div class="detail-row"><span class="detail-label">Lock Period</span><span class="detail-value">{{lockDays}} days</span></div>
 {{#if txHash}}<div class="detail-row"><span class="detail-label">Tx Hash</span><span class="detail-value">{{txHashShort}}</span></div>{{/if}}

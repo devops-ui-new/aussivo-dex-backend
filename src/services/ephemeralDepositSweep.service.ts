@@ -261,7 +261,9 @@ async function applyDepositAccounting(
     },
   });
 
-  const monthlyYield = ((amount * apyPercent) / 100).toFixed(2);
+  // apyPercent is ANNUAL; show/derive monthly as annual / 12.
+  const apyMonthly = (apyPercent / 12).toFixed(2);
+  const monthlyYield = ((amount * (apyPercent / 12)) / 100).toFixed(2);
   if (!opts?.skipConfirmationEmail) {
     try {
       await sendEmail(user.email, "✅ Deposit Confirmed — Aussivo.DEX", "deposit-confirmation", {
@@ -270,6 +272,7 @@ async function applyDepositAccounting(
         asset: symbol,
         vaultName: vault.name,
         apyPercent: apyPercent.toFixed(1),
+        apyMonthly,
         monthlyYield,
         lockDays: vault.lockDays,
         txHash: recordHash,
@@ -393,7 +396,9 @@ async function tryNotifyIncomingFundsDuringWindow(
 
   const vaultName = (vault as { name?: string }).name || "Vault";
   const apyPercent = tierApyForDepositAmount(cumulativeNum, vault as any);
-  const monthlyYield = ((incrementNum * apyPercent) / 100).toFixed(2);
+  // apyPercent is ANNUAL; monthly = annual / 12.
+  const apyMonthly = (apyPercent / 12).toFixed(2);
+  const monthlyYield = ((incrementNum * (apyPercent / 12)) / 100).toFixed(2);
   const expiresAtFormatted = new Date(doc.expiresAt).toLocaleString("en-US", {
     year: "numeric",
     month: "short",
@@ -414,6 +419,7 @@ async function tryNotifyIncomingFundsDuringWindow(
         asset: doc.asset,
         vaultName,
         apyPercent: apyPercent.toFixed(1),
+        apyMonthly,
         monthlyYield,
         lockDays: (vault as any).lockDays,
         date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
@@ -421,7 +427,7 @@ async function tryNotifyIncomingFundsDuringWindow(
       if (!ok) throw new Error("email not sent (SMTP disabled or send failed)");
       logger.info(`[EphemeralSweep] Partial window email (${subject}) → ${user.email} increment=${incrementFormatted}`);
     } else {
-      const monthlyYieldFull = ((cumulativeNum * apyPercent) / 100).toFixed(2);
+      const monthlyYieldFull = ((cumulativeNum * (apyPercent / 12)) / 100).toFixed(2);
       const ok = await sendEmail(user.email, "Incoming transfer detected — Aussivo.DEX", "deposit-confirmation", {
         incomingFullWindow: true,
         name: user.name || "",
@@ -430,6 +436,7 @@ async function tryNotifyIncomingFundsDuringWindow(
         asset: doc.asset,
         vaultName,
         apyPercent: apyPercent.toFixed(1),
+        apyMonthly,
         monthlyYield: monthlyYieldFull,
         lockDays: (vault as any).lockDays,
         expiresAtFormatted,
@@ -459,11 +466,15 @@ async function sweepOne(pendingArg: any): Promise<void> {
     const ephemeral = String(doc.ephemeralAddress).toLowerCase();
     let bal: bigint = await erc20.balanceOf(ephemeral);
     const expected = BigInt(String(doc.expectedAmountBaseUnits || "0"));
+    const isOpen = (doc as any).openAmount === true;
     const nowMs = Date.now();
     const expiresMs = new Date(doc.expiresAt).getTime();
     const isWindowOpen = nowMs < expiresMs;
 
-    if (isWindowOpen) {
+    // EXPECTED-AMOUNT intents wait for the window to close (to aggregate partials and
+    // send "incoming funds" emails). OPEN-AMOUNT intents skip the wait and credit as soon
+    // as any funds are detected — the user just scans and sends, and we capture it fast.
+    if (isWindowOpen && !isOpen) {
       if (bal > 0n) {
         await tryNotifyIncomingFundsDuringWindow(doc, bal, expected, tokenAddr);
         logger.info(
@@ -474,7 +485,8 @@ async function sweepOne(pendingArg: any): Promise<void> {
     }
 
     if (bal === 0n) {
-      if (doc.status === "pending" && !doc.userCreditedAt && !doc.sweepTxHash) {
+      // Nothing arrived. Expire only once the address validity window has passed.
+      if (!isWindowOpen && doc.status === "pending" && !doc.userCreditedAt && !doc.sweepTxHash) {
         await PendingDepositModel.findByIdAndUpdate(doc._id, { status: "expired" });
         logger.info(`[EphemeralSweep] Expired empty intent ${doc.requestId}`);
       }

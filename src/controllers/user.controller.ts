@@ -460,12 +460,20 @@ export default class UserController {
   }
 
   // ── DEPOSIT (ephemeral address + QR; server sweeps to treasury after payment) ──
+  // `amount` is OPTIONAL. When omitted/0 the address is "open-amount": the user simply
+  // scans and sends any amount from their wallet, and the sweep service captures and
+  // credits whatever arrives, fast (no upfront amount, no exact-match required).
   async getDepositQR(body: {
     vaultId: string;
-    amount: number;
+    amount?: number;
   }): Promise<IResponse> {
     try {
-      const { vaultId, amount } = body;
+      const { vaultId } = body;
+      const rawAmount = Number(body.amount);
+      const hasAmount = Number.isFinite(rawAmount) && rawAmount > 0;
+      const amount = hasAmount ? rawAmount : 0;
+      const openAmount = !hasAmount;
+
       const vault = await VaultModel.findById(vaultId);
       if (!vault || vault.status !== "active")
         return {
@@ -474,27 +482,17 @@ export default class UserController {
           message: "Vault not found or inactive",
           status: 404,
         };
-      if (amount < vault.minDeposit)
-        return {
-          data: null,
-          error: "Below minimum",
-          message: `Minimum deposit is $${vault.minDeposit}`,
-          status: 400,
-        };
-      if (amount > vault.maxDeposit)
-        return {
-          data: null,
-          error: "Above maximum",
-          message: `Maximum deposit is $${vault.maxDeposit}`,
-          status: 400,
-        };
-      if (vault.totalStaked + amount > vault.capacity)
-        return {
-          data: null,
-          error: "Vault full",
-          message: "Vault capacity reached",
-          status: 400,
-        };
+
+      // Bounds only apply when the user pre-specified an amount. Open-amount deposits
+      // capture whatever the user sends and credit it on detection.
+      if (hasAmount) {
+        if (amount < vault.minDeposit)
+          return { data: null, error: "Below minimum", message: `Minimum deposit is $${vault.minDeposit}`, status: 400 };
+        if (amount > vault.maxDeposit)
+          return { data: null, error: "Above maximum", message: `Maximum deposit is $${vault.maxDeposit}`, status: 400 };
+        if (vault.totalStaked + amount > vault.capacity)
+          return { data: null, error: "Vault full", message: "Vault capacity reached", status: 400 };
+      }
 
       if (!EPHEMERAL_WALLET_SECRET || EPHEMERAL_WALLET_SECRET.length < 8) {
         return {
@@ -511,7 +509,9 @@ export default class UserController {
       };
       const tokenAddress = TOKEN_ADDRESSES[vault.asset];
       const decimals = 18;
-      const amountInBaseUnits = BigInt(Math.round(amount * 10 ** 6)) * BigInt(10 ** (decimals - 6));
+      const amountInBaseUnits = hasAmount
+        ? (BigInt(Math.round(amount * 10 ** 6)) * BigInt(10 ** (decimals - 6))).toString()
+        : "0";
       const requestId = `0x${randomBytes(32).toString("hex")}`;
 
       const ephemeral = ethers.Wallet.createRandom();
@@ -519,18 +519,21 @@ export default class UserController {
       const privateKeyEncrypted = encryptPrivateKeyHex(ephemeral.privateKey, EPHEMERAL_WALLET_SECRET);
       const privateKeyHash = hashPrivateKeyHexFingerprint(ephemeral.privateKey);
 
-      const INTENT_TTL_MS = 15 * 60 * 1000; // 15 minutes
+      // Open-amount addresses stay valid longer (user picks the amount in their wallet);
+      // they are credited on first detection regardless of this window.
+      const INTENT_TTL_MS = openAmount ? 60 * 60 * 1000 : 15 * 60 * 1000;
       const expiresAt = new Date(Date.now() + INTENT_TTL_MS);
 
       const pendingDoc = await PendingDepositModel.create({
         userId: this.userId,
         vaultId,
         expectedAmount: amount,
-        expectedAmountBaseUnits: amountInBaseUnits.toString(),
+        expectedAmountBaseUnits: amountInBaseUnits,
         requestId,
         asset: vault.asset,
         walletAddress: ephemeralAddress,
         ephemeralAddress,
+        openAmount,
         privateKeyEncrypted,
         privateKeyHash,
         expiresAt,
@@ -557,8 +560,9 @@ export default class UserController {
           qrEip681: qrPayload,
           depositAddress: ephemeral.address,
           tokenAddress,
-          amount,
-          amountInBaseUnits: amountInBaseUnits.toString(),
+          openAmount,
+          amount: hasAmount ? amount : null,
+          amountInBaseUnits,
           requestId,
           asset: vault.asset,
           network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
@@ -778,15 +782,14 @@ export default class UserController {
       const withFlag = deposits.map((d: any) => {
         const obj = d.toObject();
         const v = obj.vaultId || {};
-        const tierMonthly = v.tiers?.[0]?.apyPercent || 0;
+        // Tier apyPercent and displayApy are ANNUAL %. Monthly = annual / 12.
+        const tierAnnual = v.tiers?.[0]?.apyPercent || 0;
         const poolApy =
-          v.displayApy != null ? Number(v.displayApy) : tierMonthly * 12;
+          v.displayApy != null ? Number(v.displayApy) : tierAnnual;
         const poolApyMonthly =
           v.displayApyMonthly != null
             ? Number(v.displayApyMonthly)
-            : v.displayApy != null
-            ? Number(v.displayApy) / 12
-            : tierMonthly;
+            : poolApy / 12;
         return {
           ...obj,
           redemptionPending: pendingSet.has(String(obj._id)),

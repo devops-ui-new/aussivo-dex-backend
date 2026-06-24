@@ -70,7 +70,10 @@ export const EMAIL_FROM = process.env.SMTP_FROM || process.env.EMAIL_FROM || 'no
 export const EMAIL_FROM_NAME = process.env.SMTP_FROM_NAME || process.env.EMAIL_FROM_NAME || 'Aussivo.DEX';
 
 // APY Config
-export const APY_CRON_SCHEDULE = process.env.APY_CRON_SCHEDULE || '0 0 1 * *';
+// Crediting is per-deposit on 30-day rolling cycles (see apyDistribution.helper.ts).
+// The cron only needs to run often enough to catch each deposit's 30-day mark, so it
+// runs DAILY by default. (Use '0 * * * *' for hourly if you want tighter crediting.)
+export const APY_CRON_SCHEDULE = process.env.APY_CRON_SCHEDULE || '0 0 * * *';
 export const REFERRAL_L1_PERCENT = parseFloat(process.env.REFERRAL_L1_PERCENT || '0.35');
 export const REFERRAL_L2_PERCENT = parseFloat(process.env.REFERRAL_L2_PERCENT || '0.15');
 

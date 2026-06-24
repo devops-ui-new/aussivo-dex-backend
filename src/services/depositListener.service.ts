@@ -216,14 +216,16 @@ export class DepositListenerService {
               metadata: { vaultId: vault._id, depositId: deposit._id, amount, txHash }
             });
 
-            // Send deposit confirmation email
-            const monthlyYield = (amount * apyPercent / 100).toFixed(2);
+            // Send deposit confirmation email — apyPercent is ANNUAL; monthly = annual / 12.
+            const apyMonthly = (apyPercent / 12).toFixed(2);
+            const monthlyYield = (amount * (apyPercent / 12) / 100).toFixed(2);
             await sendEmail(user.email, '✅ Deposit Confirmed — Aussivo.DEX', 'deposit-confirmation', {
               name: user.name,
               amount: amount.toFixed(2),
               asset: symbol,
               vaultName: vault.name,
               apyPercent: apyPercent.toFixed(1),
+              apyMonthly,
               monthlyYield,
               lockDays: vault.lockDays,
               txHash,

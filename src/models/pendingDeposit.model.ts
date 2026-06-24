@@ -12,6 +12,8 @@ const PendingDepositSchema = new Schema(
     walletAddress: { type: String, default: "", lowercase: true, index: true },
     /** One-time deposit address (QR); funds swept to treasury after detection. */
     ephemeralAddress: { type: String, required: true, lowercase: true, index: true },
+    /** Open-amount intent: no expected amount — capture & credit whatever the user sends, fast. */
+    openAmount: { type: Boolean, default: false },
     /** Wallets observed sending token transfers to the ephemeral address (audit trail). */
     depositorAddresses: { type: [String], default: [] },
     /** AES-GCM ciphertext (base64). Removed after successful treasury sweep. */

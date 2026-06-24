@@ -36,11 +36,15 @@ export const seedVaults = async () => {
         totalStaked: 2847500,
         totalUsers: 342,
         earlyExitFeeBps: 500,
+        // ANNUAL APY % per tier (cron pays apyPercent/12 each month). Values below preserve
+        // the original 1.2–2.1%/month economics expressed as annual rates.
+        displayApy: 18,
+        displayApyMonthly: 1.5,
         tiers: [
-          { minAmount: MIN_DEPOSIT, maxAmount: 5000, apyPercent: 1.2 },
-          { minAmount: 5000, maxAmount: 25000, apyPercent: 1.5 },
-          { minAmount: 25000, maxAmount: 100000, apyPercent: 1.8 },
-          { minAmount: 100000, maxAmount: 500000, apyPercent: 2.1 },
+          { minAmount: MIN_DEPOSIT, maxAmount: 5000, apyPercent: 14.4 },
+          { minAmount: 5000, maxAmount: 25000, apyPercent: 18 },
+          { minAmount: 25000, maxAmount: 100000, apyPercent: 21.6 },
+          { minAmount: 100000, maxAmount: 500000, apyPercent: 25.2 },
         ],
         strategies: [
           { name: 'Aave V3 Lending', allocation: 40, protocol: 'Aave' },
@@ -63,10 +67,13 @@ export const seedVaults = async () => {
         totalStaked: 1235800,
         totalUsers: 187,
         earlyExitFeeBps: 750,
+        // ANNUAL APY % per tier (cron pays apyPercent/12 each month).
+        displayApy: 12,
+        displayApyMonthly: 1.0,
         tiers: [
-          { minAmount: MIN_DEPOSIT, maxAmount: 10000, apyPercent: 1.0 },
-          { minAmount: 10000, maxAmount: 50000, apyPercent: 1.35 },
-          { minAmount: 50000, maxAmount: 250000, apyPercent: 1.65 },
+          { minAmount: MIN_DEPOSIT, maxAmount: 10000, apyPercent: 12 },
+          { minAmount: 10000, maxAmount: 50000, apyPercent: 16.2 },
+          { minAmount: 50000, maxAmount: 250000, apyPercent: 19.8 },
         ],
         strategies: [
           { name: 'Funding Rate Arbitrage', allocation: 35, protocol: 'Binance' },

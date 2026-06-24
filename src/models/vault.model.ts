@@ -3,7 +3,7 @@ import { Schema, model } from 'mongoose';
 const TierSchema = new Schema({
   minAmount: { type: Number, required: true, min: 0 },
   maxAmount: { type: Number, required: true, min: 0 },
-  apyPercent: { type: Number, required: true, min: 0 },  // monthly APY %
+  apyPercent: { type: Number, required: true, min: 0 },  // ANNUAL APY % (monthly = apyPercent/12)
 }, { _id: false });
 
 const VaultSchema = new Schema({

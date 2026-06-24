@@ -14,9 +14,10 @@ router.use('/admin', adminRoutes);
 // ═══ Frontend compatibility routes ═══
 
 const formatVault = (v: any) => {
-  const tierMonthly = v.tiers?.[0]?.apyPercent || 0;
-  const annual = v.displayApy != null ? v.displayApy : tierMonthly * 12;
-  const monthly = v.displayApyMonthly != null ? v.displayApyMonthly : (v.displayApy != null ? v.displayApy / 12 : tierMonthly);
+  // Tier apyPercent and displayApy are ANNUAL %. Monthly = annual / 12.
+  const tierAnnual = v.tiers?.[0]?.apyPercent || 0;
+  const annual = v.displayApy != null ? v.displayApy : tierAnnual;
+  const monthly = v.displayApyMonthly != null ? v.displayApyMonthly : (annual / 12);
   return {
   ...v.toObject ? v.toObject() : v,
   id: v._id,
