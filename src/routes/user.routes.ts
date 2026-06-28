@@ -58,6 +58,9 @@ router.get('/deposits', authenticateUser, async (req: Request, res: Response) =>
 router.get('/yield-logs', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).getYieldLogs(Number(req.query.page) || 1, Number(req.query.limit) || 20, req.query.source as string); return sendResponse(res, r.status, r);
 });
+router.get('/withdrawals', authenticateUser, async (req: Request, res: Response) => {
+  const r = await new UserController(req, res).getMyWithdrawals(Number(req.query.page) || 1, Number(req.query.limit) || 20); return sendResponse(res, r.status, r);
+});
 router.get('/referrals', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).getReferralData(); return sendResponse(res, r.status, r);
 });

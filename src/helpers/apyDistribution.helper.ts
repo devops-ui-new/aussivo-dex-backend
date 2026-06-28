@@ -29,90 +29,11 @@ export const distributeMonthlyAPY = async () => {
 
     for (const deposit of activeDeposits) {
       try {
-        // ── 30-DAY ROLLING CYCLES (per deposit, anchored on its own start date) ──
-        // Yield is credited once for every full 30 days the deposit has been active,
-        // measured from `createdAt` (NOT calendar months). This is drift-free and
-        // catch-up safe: the number paid is always derived from elapsed time vs the
-        // number already paid, so a missed/duplicate cron run can never over- or
-        // under-pay. The live per-hour figure shown in the UI is only an estimate;
-        // the withdrawable balance steps up here, every 30 days.
-        const CYCLE_MS = 30 * 24 * 60 * 60 * 1000; // one 30-day cycle
-        const createdMs = new Date(deposit.createdAt as any).getTime();
-        const elapsedMs = Date.now() - createdMs;
-
-        // Whole 30-day cycles earned so far, capped at the deposit's term.
-        const cyclesEarned = Math.min(
-          Math.floor(elapsedMs / CYCLE_MS),
-          deposit.maxYieldPayments
-        );
-        const alreadyPaid = deposit.yieldPaymentsCount || 0;
-        const cyclesToPay = cyclesEarned - alreadyPaid;
-
-        if (cyclesToPay <= 0) {
-          // Nothing new is due yet. Mark matured once the full term has been paid.
-          if (alreadyPaid >= deposit.maxYieldPayments) {
-            await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
-            logger.info(`[APY-CRON] Deposit ${deposit._id} matured after ${alreadyPaid} payments`);
-          }
-          continue;
+        const settled = await settleDepositYield(deposit);
+        if (settled > 0) {
+          totalDistributed += settled;
+          usersProcessed++;
         }
-
-        // apyPercent is the ANNUAL APY %. Each 30-day cycle pays principal * (annual / 12) / 100.
-        const monthlyYield = (deposit.amount * (deposit.apyPercent / 12)) / 100;
-        if (monthlyYield <= 0) continue;
-
-        const user = await UserModel.findById(deposit.userId);
-        if (!user || user.status !== 'active') continue;
-
-        const yieldField = deposit.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
-
-        // Credit each completed 30-day cycle since the last payout (normally 1;
-        // only > 1 if the cron was offline across multiple cycles).
-        for (let k = 1; k <= cyclesToPay; k++) {
-          const paymentNumber = alreadyPaid + k;
-
-          await UserModel.findByIdAndUpdate(user._id, {
-            $inc: { [yieldField]: monthlyYield }
-          });
-
-          await YieldLogModel.create({
-            userId: user._id,
-            depositId: deposit._id,
-            vaultId: vault._id,
-            amount: monthlyYield,
-            asset: deposit.asset,
-            apyPercent: deposit.apyPercent,
-            depositAmount: deposit.amount,
-            paymentNumber,
-            source: 'vault_apy',
-          });
-
-          await ActivityModel.create({
-            userId: user._id,
-            title: 'APY Yield Credited',
-            description: `$${monthlyYield.toFixed(2)} ${deposit.asset} yield from ${vault.name} (30-day cycle ${paymentNumber}/${deposit.maxYieldPayments})`,
-            type: 'yield',
-            metadata: { vaultId: vault._id, depositId: deposit._id, amount: monthlyYield, paymentNumber }
-          });
-
-          totalDistributed += monthlyYield;
-
-          // Referral commissions on each cycle's yield (L1 0.35%, L2 0.15% of yield).
-          await distributeReferralCommissions(user._id, monthlyYield, deposit.asset, deposit._id, vault._id);
-        }
-
-        // Advance the deposit's paid-cycle counter once for the whole batch.
-        await DepositModel.findByIdAndUpdate(deposit._id, {
-          $inc: { totalYieldPaid: monthlyYield * cyclesToPay, yieldPaymentsCount: cyclesToPay }
-        });
-
-        usersProcessed++;
-
-        if (alreadyPaid + cyclesToPay >= deposit.maxYieldPayments) {
-          await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
-          logger.info(`[APY-CRON] Deposit ${deposit._id} matured after ${alreadyPaid + cyclesToPay} payments`);
-        }
-
       } catch (err: any) {
         errors++;
         logger.error(`[APY-CRON] Error processing deposit ${deposit._id}: ${err.message}`);
@@ -122,6 +43,128 @@ export const distributeMonthlyAPY = async () => {
 
   logger.info(`[APY-CRON] Distribution complete. Total: $${totalDistributed.toFixed(2)}, Users: ${usersProcessed}, Errors: ${errors}`);
   return { totalDistributed, usersProcessed, errors };
+};
+
+/**
+ * Continuous yield accrual — the single source of truth for crediting yield.
+ *
+ * Yield accrues every second (not in 30-day jumps). The amount EARNED by `now` is
+ *   entitled = min( monthlyYield * elapsed/30days , monthlyYield * maxYieldPayments )
+ * and `totalYieldPaid` is the running total already credited. We credit the difference.
+ *
+ * This is drift-free and idempotent: re-running it credits nothing extra, because it
+ * compares absolute elapsed time to what's already been paid. It's called BOTH by the
+ * daily cron (to keep wallets fresh for display) AND on-demand when a user withdraws
+ * yield — which is what makes yield withdrawable anytime.
+ *
+ * Returns the amount newly credited (0 if nothing was due).
+ */
+export const settleDepositYield = async (deposit: any, opts: { log?: boolean } = {}): Promise<number> => {
+  const log = opts.log !== false; // default true (cron). Pass {log:false} for on-demand settles.
+  const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
+  const monthlyYield = (deposit.amount * (deposit.apyPercent / 12)) / 100; // apyPercent is ANNUAL
+  if (monthlyYield <= 0) return 0;
+
+  const maxTotal = monthlyYield * (deposit.maxYieldPayments || 0);
+  const createdMs = new Date(deposit.createdAt as any).getTime();
+  const elapsedMs = Date.now() - createdMs;
+
+  const entitled = Math.min(monthlyYield * (elapsedMs / CYCLE_MS), maxTotal);
+  const alreadyPaid = deposit.totalYieldPaid || 0;
+  const unpaid = entitled - alreadyPaid;
+
+  // A deposit ONLY matures when its full term of time has actually elapsed — never
+  // because a (possibly stale) dollar total reached the cap. This is critical: it
+  // prevents a deposit from being wrongly closed while the principal is still locked.
+  const termComplete = deposit.maxYieldPayments > 0 && elapsedMs >= deposit.maxYieldPayments * CYCLE_MS;
+
+  // Nothing meaningful to credit (ignore sub-dust so we don't create $0.0000 log rows).
+  if (unpaid < 1e-6) {
+    if (termComplete && deposit.status === 'active') {
+      await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
+    }
+    return 0;
+  }
+
+  const user = await UserModel.findById(deposit.userId);
+  if (!user || user.status !== 'active') return 0;
+
+  const yieldField = deposit.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
+
+  await UserModel.findByIdAndUpdate(user._id, { $inc: { [yieldField]: unpaid } });
+
+  await DepositModel.findByIdAndUpdate(deposit._id, {
+    $inc: { totalYieldPaid: unpaid, yieldPaymentsCount: 1 },
+    ...(termComplete ? { status: 'matured' } : {}),
+  });
+
+  // Logs / activity / referral are the "official accounting" — only created by the daily
+  // cron, NOT by the silent on-demand settle that runs when a user withdraws. That keeps
+  // "Recent Yield Payments" free of a new row for every withdraw click.
+  if (log) {
+    await YieldLogModel.create({
+      userId: user._id,
+      depositId: deposit._id,
+      vaultId: deposit.vaultId,
+      amount: unpaid,
+      asset: deposit.asset,
+      apyPercent: deposit.apyPercent,
+      depositAmount: deposit.amount,
+      paymentNumber: (deposit.yieldPaymentsCount || 0) + 1,
+      source: 'vault_apy',
+    });
+    await ActivityModel.create({
+      userId: user._id,
+      title: 'APY Yield Credited',
+      description: `$${unpaid.toFixed(6)} ${deposit.asset} yield accrued`,
+      type: 'yield',
+      metadata: { vaultId: deposit.vaultId, depositId: deposit._id, amount: unpaid },
+    });
+    // Referral commissions on the newly accrued yield (L1 0.35%, L2 0.15% of yield).
+    await distributeReferralCommissions(user._id, unpaid, deposit.asset, deposit._id, deposit.vaultId);
+  }
+
+  return unpaid;
+};
+
+/**
+ * Settle ONE deposit's accrued yield (silently, no log) and return how much of THIS
+ * deposit's yield is withdrawable right now: credited minus already-withdrawn, capped
+ * at the user's actual wallet balance for the asset (the binding safety constraint).
+ */
+export const getWithdrawableDepositYield = async (
+  deposit: any
+): Promise<number> => {
+  await settleDepositYield(deposit, { log: false });
+  const fresh = await DepositModel.findById(deposit._id);
+  if (!fresh) return 0;
+  const user = await UserModel.findById(fresh.userId);
+  if (!user) return 0;
+  const field = fresh.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
+  const walletBal = Number((user as any)[field] || 0);
+  const ownYield = Number(fresh.totalYieldPaid || 0) - Number((fresh as any).yieldWithdrawn || 0);
+  return Math.max(0, Math.min(ownYield, walletBal));
+};
+
+/**
+ * Settle (credit) all of a user's currently-accrued yield for one asset, then return the
+ * user's resulting withdrawable yield-wallet balance for that asset. Called right before a
+ * yield withdrawal so the user can take out everything they've earned, at any moment.
+ */
+export const settleUserYieldForAsset = async (
+  userId: string,
+  asset: string
+): Promise<number> => {
+  const deposits = await DepositModel.find({ userId, asset, status: 'active' });
+  for (const d of deposits) {
+    try { await settleDepositYield(d, { log: false }); } catch (e: any) {
+      logger.error(`[YieldSettle] deposit ${d._id}: ${e.message}`);
+    }
+  }
+  const user = await UserModel.findById(userId);
+  if (!user) return 0;
+  const field = asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
+  return Number((user as any)[field] || 0);
 };
 
 /**

@@ -23,6 +23,7 @@ import {
   EPHEMERAL_WALLET_SECRET,
 } from "../configs/constants";
 import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/walletCrypto.helper";
+import { settleUserYieldForAsset, getWithdrawableDepositYield } from "../helpers/apyDistribution.helper";
 import { fundEphemeralGas } from "../services/ephemeralDepositSweep.service";
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
@@ -837,6 +838,30 @@ export default class UserController {
     }
   }
 
+  // ── MY WITHDRAWALS (history with status) ──
+  async getMyWithdrawals(page = 1, limit = 20): Promise<IResponse> {
+    try {
+      const skip = (page - 1) * limit;
+      const query: any = { userId: this.userId };
+      const [requests, total] = await Promise.all([
+        WithdrawRequestModel.find(query)
+          .populate("depositId", "amount asset")
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit),
+        WithdrawRequestModel.countDocuments(query),
+      ]);
+      return {
+        data: { requests, total, page, limit },
+        error: null,
+        message: "Withdrawals retrieved",
+        status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: "Error", status: 500 };
+    }
+  }
+
   // ── REFERRAL DATA ──
   async getReferralData(): Promise<IResponse> {
     try {
@@ -917,7 +942,8 @@ export default class UserController {
         const deposit = await DepositModel.findById(depositId);
         if (!deposit || String(deposit.userId) !== String(user._id))
           return { data: null, error: "Not found", message: "Deposit not found", status: 404 };
-        if (deposit.status !== "active")
+        // Active OR matured deposits can have their principal redeemed.
+        if (deposit.status !== "active" && deposit.status !== "matured")
           return { data: null, error: "Invalid state", message: "Deposit is not redeemable", status: 400 };
         if (deposit.lockUntil && new Date(deposit.lockUntil) > new Date())
           return { data: null, error: "Locked", message: "Deposit is still locked", status: 400 };
@@ -939,11 +965,54 @@ export default class UserController {
       }
 
       // ── YIELD / REFERRAL off-chain balance withdrawals ──
+      // Yield is withdrawable ANYTIME. If a depositId is given, withdraw ONLY that one
+      // deposit's earned yield. Without a depositId (the top "Yield" card) we withdraw the
+      // whole earned balance for the asset.
       let balanceField = "";
-      if (source === "yield")
+      if (source === "yield") {
         balanceField = asset === "USDT" ? "yieldWalletUSDT" : "yieldWalletUSDC";
-      else if (source === "referral") balanceField = "referralEarnings";
-      else
+
+        if (depositId) {
+          // ── PER-DEPOSIT yield withdrawal ──
+          const deposit = await DepositModel.findById(depositId);
+          if (!deposit || String(deposit.userId) !== String(user._id))
+            return { data: null, error: "Not found", message: "Deposit not found", status: 404 };
+
+          const withdrawable = await getWithdrawableDepositYield(deposit);
+          if (withdrawable < 1e-6)
+            return { data: null, error: "Nothing to withdraw", message: "No yield earned to withdraw yet", status: 400 };
+
+          const request = await WithdrawRequestModel.create({
+            userId: user._id,
+            amount: withdrawable,
+            asset: deposit.asset,
+            walletAddress,
+            source: "yield",
+            depositId: deposit._id,
+          });
+          // Take it out of the wallet and mark it withdrawn against THIS deposit only.
+          await UserModel.findByIdAndUpdate(user._id, { $inc: { [balanceField]: -withdrawable } });
+          await DepositModel.findByIdAndUpdate(deposit._id, { $inc: { yieldWithdrawn: withdrawable } });
+          return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
+        }
+
+        // ── AGGREGATE: all earned yield for this asset ──
+        const settledBalance = await settleUserYieldForAsset(String(user._id), asset);
+        if (settledBalance <= 0) {
+          return { data: null, error: "Nothing to withdraw", message: "No yield earned to withdraw yet", status: 400 };
+        }
+        const request = await WithdrawRequestModel.create({
+          userId: user._id,
+          amount: settledBalance,
+          asset,
+          walletAddress,
+          source,
+        });
+        await UserModel.findByIdAndUpdate(user._id, { $inc: { [balanceField]: -settledBalance } });
+        return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
+      } else if (source === "referral") {
+        balanceField = "referralEarnings";
+      } else
         return {
           data: null,
           error: "Invalid source",

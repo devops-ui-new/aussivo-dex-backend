@@ -15,6 +15,8 @@ const DepositSchema = new Schema({
   apyPercent: { type: Number, required: true },
   tierIndex: { type: Number, default: 0 },
   totalYieldPaid: { type: Number, default: 0 },
+  /** How much of THIS deposit's credited yield has already been withdrawn. */
+  yieldWithdrawn: { type: Number, default: 0 },
   yieldPaymentsCount: { type: Number, default: 0 },
   maxYieldPayments: { type: Number, required: true },  // = vault durationMonths
   status: { type: String, enum: ['active', 'withdrawn', 'matured'], default: 'active' },

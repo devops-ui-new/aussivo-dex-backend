@@ -198,30 +198,41 @@ export default class AdminController {
           } catch (err: any) {
             // Revert the claim so the admin can retry (assumes tx did not land; admin must verify on-chain if ambiguous).
             await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'pending', reviewedBy: null, reviewNote: `payout failed: ${err.message}` });
-            return { data: null, error: err.message, message: `On-chain payout failed: ${err.message}`, status: 500 };
+            const lowGas = err?.code === 'INSUFFICIENT_FUNDS' || /insufficient funds/i.test(err?.message || '');
+            const friendly = lowGas
+              ? 'Payout wallet is out of BNB for gas. Top up the payout wallet with BNB and approve again (the request is back to pending — nothing was lost).'
+              : `On-chain payout failed: ${err.message}`;
+            return { data: null, error: err.message, message: friendly, status: 500 };
           }
         }
 
         await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'completed', txHash: finalTxHash });
         await UserModel.findByIdAndUpdate(request.userId, { $inc: { totalWithdrawn: request.amount } });
 
-        // Deposit (principal) redemptions: mark deposit withdrawn and decrement vault TVL
+        // ── The balance change happens HERE, on approval — never at submit time. ──
         if (request.source === 'deposit' && request.depositId) {
+          // Principal redemption: close the deposit and decrement vault TVL.
           const deposit = await DepositModel.findById(request.depositId);
-          if (deposit && deposit.status === 'active') {
+          if (deposit && (deposit.status === 'active' || deposit.status === 'matured')) {
             await DepositModel.findByIdAndUpdate(request.depositId, { status: 'withdrawn', withdrawnAt: new Date() });
             await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: -deposit.amount, totalUsers: -1 } });
           }
+        } else if (request.source === 'yield' && request.depositId) {
+          // Per-deposit yield: now mark it withdrawn against that deposit.
+          await DepositModel.findByIdAndUpdate(request.depositId, { $inc: { yieldWithdrawn: request.amount } });
+        } else if (request.source === 'yield') {
+          // Aggregate yield: now debit the yield wallet.
+          const f = request.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
+          await UserModel.findByIdAndUpdate(request.userId, { $inc: { [f]: -request.amount } });
+        } else if (request.source === 'referral') {
+          await UserModel.findByIdAndUpdate(request.userId, { $inc: { referralEarnings: -request.amount } });
         }
 
         await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Approved', type: 'admin', metadata: { requestId, amount: request.amount, txHash: finalTxHash } });
         return { data: { txHash: finalTxHash }, error: null, message: 'Withdrawal approved', status: 200 };
       } else {
-        // Refund off-chain balance (yield/referral). Deposit redemptions have no debit, so nothing to refund.
-        let balanceField = '';
-        if (request.source === 'yield') balanceField = request.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
-        else if (request.source === 'referral') balanceField = 'referralEarnings';
-        if (balanceField) await UserModel.findByIdAndUpdate(request.userId, { $inc: { [balanceField]: request.amount } });
+        // REJECT: nothing was ever deducted at submit time, so there is nothing to refund —
+        // every balance stays exactly as it was. Just mark the request rejected.
         await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'rejected', reviewedBy: this.adminId, reviewNote: note || '' });
         await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Rejected', type: 'admin', metadata: { requestId, amount: request.amount } });
         return { data: null, error: null, message: 'Withdrawal rejected', status: 200 };
