@@ -33,8 +33,11 @@ export const seedVaults = async () => {
         minDeposit: MIN_DEPOSIT,
         maxDeposit: 500000,
         capacity: 10000000,
-        totalStaked: 2847500,
-        totalUsers: 342,
+        totalStaked: 0,
+        totalUsers: 0,
+        baselineStaked: 2847500,
+        baselineUsers: 342,
+        baselineTransactions: 600,
         earlyExitFeeBps: 500,
         // ANNUAL APY % per tier (cron pays apyPercent/12 each month). Values below preserve
         // the original 1.2–2.1%/month economics expressed as annual rates.
@@ -64,8 +67,11 @@ export const seedVaults = async () => {
         minDeposit: MIN_DEPOSIT,
         maxDeposit: 250000,
         capacity: 5000000,
-        totalStaked: 1235800,
-        totalUsers: 187,
+        totalStaked: 0,
+        totalUsers: 0,
+        baselineStaked: 1235800,
+        baselineUsers: 187,
+        baselineTransactions: 400,
         earlyExitFeeBps: 750,
         // ANNUAL APY % per tier (cron pays apyPercent/12 each month).
         displayApy: 12,

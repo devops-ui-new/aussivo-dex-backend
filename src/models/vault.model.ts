@@ -16,8 +16,11 @@ const VaultSchema = new Schema({
   minDeposit: { type: Number, required: true, min: 0 },
   maxDeposit: { type: Number, required: true },
   capacity: { type: Number, required: true },              // total TVL cap
-  totalStaked: { type: Number, default: 0 },
-  totalUsers: { type: Number, default: 0 },
+  totalStaked: { type: Number, default: 0 },     // REAL: moves only on real deposits/redemptions
+  totalUsers: { type: Number, default: 0 },       // REAL: distinct real depositors
+  baselineStaked: { type: Number, default: 0 },   // fixed launch baseline, disclosed separately
+  baselineUsers: { type: Number, default: 0 },    // fixed launch baseline, disclosed separately
+  baselineTransactions: { type: Number, default: 0 }, // fixed launch baseline, disclosed separately
   earlyExitFeeBps: { type: Number, default: 0 },           // basis points e.g. 500 = 5%
   displayApy: { type: Number, default: null },             // admin-set annual APY shown on /pools and /pool/:id (overrides tier calc)
   displayApyMonthly: { type: Number, default: null },      // admin-set monthly APY shown in badges (overrides tier calc)

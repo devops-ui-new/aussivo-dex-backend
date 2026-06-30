@@ -4,6 +4,7 @@ import adminRoutes from './admin.routes';
 import VaultModel from '../models/vault.model';
 import UserModel from '../models/user.model';
 import DepositModel from '../models/deposit.model';
+import WithdrawRequestModel from '../models/withdrawRequest.model';
 import { sendResponse } from '../utils/response.util';
 
 const router = express.Router();
@@ -31,6 +32,8 @@ const formatVault = (v: any) => {
   utilization: v.capacity > 0 ? ((v.totalStaked / v.capacity) * 100).toFixed(1) : '0',
   assetSymbol: v.asset,
   total_staked: (v.totalStaked || 0) * 1e6,
+  baseline_staked: (v.baselineStaked || 0) * 1e6,
+  baseline_users: v.baselineUsers || 0,
   min_deposit: (v.minDeposit || 0) * 1e6,
   max_deposit: (v.maxDeposit || 0) * 1e6,
   capacity: (v.capacity || 0) * 1e6,
@@ -57,17 +60,52 @@ router.get('/pools/:id', async (req, res) => {
   } catch { res.status(404).json({ error: 'Not found' }); }
 });
 
-// /api/stats → platform statistics
+// /api/stats → platform statistics.
+// TVL and users are reported as REAL (live deposits) + a fixed launch BASELINE, plus the combined
+// total. Users are summed from the same vault fields the pool cards use, so hero and cards reconcile.
 router.get('/stats', async (req, res) => {
   try {
-    const [tvlAgg, poolCount, userCount, depositCount] = await Promise.all([
-      VaultModel.aggregate([{ $match: { status: 'active' } }, { $group: { _id: null, total: { $sum: '$totalStaked' } } }]),
+    const [agg, poolCount, depositCount, withdrawCount] = await Promise.all([
+      VaultModel.aggregate([
+        { $match: { status: 'active' } },
+        { $group: {
+          _id: null,
+          realStaked: { $sum: '$totalStaked' },
+          baselineStaked: { $sum: '$baselineStaked' },
+          realUsers: { $sum: '$totalUsers' },
+          baselineUsers: { $sum: '$baselineUsers' },
+          baselineTransactions: { $sum: '$baselineTransactions' },
+        } },
+      ]),
       VaultModel.countDocuments({ status: 'active' }),
-      UserModel.countDocuments({ status: 'active' }),
       DepositModel.countDocuments(),
+      WithdrawRequestModel.countDocuments({ status: 'completed' }),
     ]);
-    res.json({ tvl: (tvlAgg[0]?.total || 0).toFixed(2), activePools: poolCount, totalUsers: userCount, totalDeposits: depositCount });
-  } catch { res.json({ tvl: '0', activePools: 0, totalUsers: 0, totalDeposits: 0 }); }
+    const a = agg[0] || {};
+    const realTvl = a.realStaked || 0;
+    const baselineTvl = a.baselineStaked || 0;
+    const realUsers = a.realUsers || 0;
+    const baselineUsers = a.baselineUsers || 0;
+    const realTx = (depositCount || 0) + (withdrawCount || 0); // real on-platform transactions
+    const baselineTx = a.baselineTransactions || 0;
+    res.json({
+      // combined (what the big number shows)
+      tvl: (realTvl + baselineTvl).toFixed(2),
+      totalUsers: realUsers + baselineUsers,
+      activePools: poolCount,
+      totalDeposits: realTx + baselineTx,           // "Transactions Executed" = real + baseline
+      // disclosed split so the UI can show the baseline as a baseline
+      tvlReal: realTvl.toFixed(2),
+      tvlBaseline: baselineTvl.toFixed(2),
+      usersReal: realUsers,
+      usersBaseline: baselineUsers,
+      txReal: realTx,
+      txBaseline: baselineTx,
+      hasBaseline: baselineTvl > 0 || baselineUsers > 0 || baselineTx > 0,
+    });
+  } catch {
+    res.json({ tvl: '0', activePools: 0, totalUsers: 0, totalDeposits: 0, tvlReal: '0', tvlBaseline: '0', usersReal: 0, usersBaseline: 0, txReal: 0, txBaseline: 0, hasBaseline: false });
+  }
 });
 
 export default router;
