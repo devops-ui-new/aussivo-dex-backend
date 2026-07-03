@@ -47,6 +47,16 @@ export const GAS_FUNDER_PRIVATE_KEY = (process.env.GAS_FUNDER_PRIVATE_KEY || '')
 export const USDT_CONTRACT_ADDRESS = process.env.USDT_CONTRACT_ADDRESS || '0x55d398326f99059fF775485246999027B3197955';
 export const USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS || '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
 
+// ─── TRON / TRC20 ───────────────────────────────────────────────────────────
+// TRC20 USDT lives on Tron (base58 addresses, 6 decimals, energy/bandwidth gas — NOT EVM).
+export const TRON_FULL_HOST = process.env.TRON_FULL_HOST || 'https://api.trongrid.io';
+export const TRON_API_KEY = (process.env.TRON_API_KEY || '').trim(); // TronGrid API key (recommended)
+export const TRON_USDT_CONTRACT = process.env.TRON_USDT_CONTRACT || 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'; // mainnet USDT-TRC20
+export const TRON_USDT_DECIMALS = 6; // TRC20 USDT uses 6 decimals (BEP20 uses 18)
+export const TRON_TREASURY_ADDRESS = (process.env.TRON_TREASURY_ADDRESS || '').trim(); // where TRC20 deposits are swept
+export const TRON_GAS_FUNDER_PRIVATE_KEY = (process.env.TRON_GAS_FUNDER_PRIVATE_KEY || '').trim(); // funds TRX for energy
+export const TRON_GAS_TOPUP_TRX = Number(process.env.TRON_GAS_TOPUP_TRX || '35'); // TRX sent to each ephemeral to cover a USDT transfer
+
 /** Canonical BSC USDT/USDC — all use 18 decimals. Avoids flaky `decimals()` eth_call on public RPC. */
 const CANONICAL_BSC_STABLE_DECIMALS: Record<string, number> = {
   '0x55d398326f99059f775485246999027b3197955': 18, // mainnet USDT

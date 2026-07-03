@@ -21,10 +21,13 @@ import {
   BSC_CHAIN_ID,
   BSC_PROVIDER_URL,
   EPHEMERAL_WALLET_SECRET,
+  TRON_TREASURY_ADDRESS,
+  TRON_USDT_CONTRACT,
 } from "../configs/constants";
 import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/walletCrypto.helper";
 import { settleUserYieldForAsset, getWithdrawableDepositYield } from "../helpers/apyDistribution.helper";
 import { fundEphemeralGas } from "../services/ephemeralDepositSweep.service";
+import { createTronEphemeral, fundTronEnergy } from "../services/tronDepositSweep.service";
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
@@ -467,9 +470,11 @@ export default class UserController {
   async getDepositQR(body: {
     vaultId: string;
     amount?: number;
+    network?: "bep20" | "trc20";
   }): Promise<IResponse> {
     try {
       const { vaultId } = body;
+      const network = body.network === "trc20" ? "trc20" : "bep20";
       const rawAmount = Number(body.amount);
       const hasAmount = Number.isFinite(rawAmount) && rawAmount > 0;
       const amount = hasAmount ? rawAmount : 0;
@@ -501,6 +506,72 @@ export default class UserController {
           error: "Server misconfigured",
           message: "Set EPHEMERAL_WALLET_SECRET (8+ chars) for deposit wallets",
           status: 500,
+        };
+      }
+
+      // ─── TRC20 (Tron) branch ───────────────────────────────────────────────
+      // Tron uses base58 addresses + 6-decimal USDT + energy/TRX gas. The Tron sweep
+      // service detects the deposit, credits via the same accounting, and sweeps to
+      // TRON_TREASURY_ADDRESS. USDC is not offered on Tron here.
+      if (network === "trc20") {
+        if (vault.asset !== "USDT") {
+          return { data: null, error: "Unsupported", message: "TRC20 supports USDT only", status: 400 };
+        }
+        if (!TRON_TREASURY_ADDRESS) {
+          return { data: null, error: "Server misconfigured", message: "TRC20 deposits are not enabled yet", status: 503 };
+        }
+        const requestIdTron = `tron_${randomBytes(24).toString("hex")}`;
+        const { address: tronAddress, privateKey: tronPk } = await createTronEphemeral();
+        const encTron = encryptPrivateKeyHex(tronPk, EPHEMERAL_WALLET_SECRET);
+        const hashTron = hashPrivateKeyHexFingerprint(tronPk);
+
+        const INTENT_TTL_MS_TRON = openAmount ? 60 * 60 * 1000 : 15 * 60 * 1000;
+        const expiresAtTron = new Date(Date.now() + INTENT_TTL_MS_TRON);
+
+        const pendingTron = await PendingDepositModel.create({
+          userId: this.userId,
+          vaultId,
+          expectedAmount: amount,
+          expectedAmountBaseUnits: hasAmount ? Math.round(amount * 1e6).toString() : "0", // 6-dec on Tron
+          requestId: requestIdTron,
+          asset: vault.asset,
+          network: "trc20",
+          walletAddress: "",
+          ephemeralAddress: tronAddress, // base58, case-preserved
+          openAmount,
+          privateKeyEncrypted: encTron,
+          privateKeyHash: hashTron,
+          expiresAt: expiresAtTron,
+        });
+
+        // Pre-fund energy so the eventual sweep can pay for the USDT transfer.
+        const energyTx = await fundTronEnergy(tronAddress);
+        if (energyTx) await PendingDepositModel.findByIdAndUpdate(pendingTron._id, { gasFundTxHash: energyTx });
+
+        const qrTron = await QRCode.toDataURL(tronAddress, { width: 300, margin: 2, color: { dark: "#000000", light: "#ffffff" } });
+
+        return {
+          data: {
+            qrCode: qrTron,
+            qrPayload: tronAddress,
+            qrPayloadAddressOnly: tronAddress,
+            depositAddress: tronAddress,
+            tokenAddress: TRON_USDT_CONTRACT,
+            openAmount,
+            amount: hasAmount ? amount : null,
+            requestId: requestIdTron,
+            asset: vault.asset,
+            network: "Tron (TRC-20)",
+            networkKey: "trc20",
+            vaultName: vault.name,
+            expiresAt: expiresAtTron.toISOString(),
+            expiresInSeconds: Math.floor(INTENT_TTL_MS_TRON / 1000),
+            gasFundTxHash: energyTx || undefined,
+            pendingDepositId: String(pendingTron._id),
+          },
+          error: null,
+          message: "Deposit address generated",
+          status: 200,
         };
       }
 
@@ -567,6 +638,7 @@ export default class UserController {
           requestId,
           asset: vault.asset,
           network: BSC_CHAIN_ID === 56 ? "BNB Smart Chain (BEP-20)" : "BSC Testnet (BEP-20, chainId 97)",
+          networkKey: "bep20",
           chainId: BSC_CHAIN_ID,
           chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
           vaultName: vault.name,
@@ -964,21 +1036,31 @@ export default class UserController {
         return { data: request, error: null, message: "Redemption request submitted", status: 201 };
       }
 
-      // ── YIELD / REFERRAL off-chain balance withdrawals ──
-      // Yield is withdrawable ANYTIME. If a depositId is given, withdraw ONLY that one
-      // deposit's earned yield. Without a depositId (the top "Yield" card) we withdraw the
-      // whole earned balance for the asset.
-      let balanceField = "";
+      // ── YIELD / REFERRAL off-chain withdrawals — DEDUCT ON APPROVAL ONLY ──
+      // Submitting NEVER changes any balance. Nothing is deducted until an admin approves
+      // the request (see admin.processWithdrawal). If it's rejected, everything stays exactly
+      // as it was. To prevent the same yield being requested twice, we block a second pending
+      // request for the same target.
       if (source === "yield") {
-        balanceField = asset === "USDT" ? "yieldWalletUSDT" : "yieldWalletUSDC";
+        const asset2 = asset === "USDC" ? "USDC" : "USDT";
 
         if (depositId) {
-          // ── PER-DEPOSIT yield withdrawal ──
+          // ── PER-DEPOSIT yield ──
           const deposit = await DepositModel.findById(depositId);
           if (!deposit || String(deposit.userId) !== String(user._id))
             return { data: null, error: "Not found", message: "Deposit not found", status: 404 };
 
-          const withdrawable = await getWithdrawableDepositYield(deposit);
+          const dup = await WithdrawRequestModel.findOne({ depositId: deposit._id, source: "yield", status: "pending" });
+          if (dup)
+            return { data: null, error: "Duplicate", message: "A yield withdrawal for this deposit is already processing", status: 400 };
+
+          // Withdrawable = time-based earned − already-withdrawn. Pure read, no DB write.
+          const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
+          const monthly = (deposit.amount * (deposit.apyPercent / 12)) / 100;
+          const maxTotal = monthly * (deposit.maxYieldPayments || 0);
+          const elapsed = Date.now() - new Date(deposit.createdAt as any).getTime();
+          const entitled = Math.min(monthly * (elapsed / CYCLE_MS), maxTotal);
+          const withdrawable = entitled - (Number((deposit as any).yieldWithdrawn) || 0);
           if (withdrawable < 1e-6)
             return { data: null, error: "Nothing to withdraw", message: "No yield earned to withdraw yet", status: 400 };
 
@@ -990,64 +1072,47 @@ export default class UserController {
             source: "yield",
             depositId: deposit._id,
           });
-          // Take it out of the wallet and mark it withdrawn against THIS deposit only.
-          await UserModel.findByIdAndUpdate(user._id, { $inc: { [balanceField]: -withdrawable } });
-          await DepositModel.findByIdAndUpdate(deposit._id, { $inc: { yieldWithdrawn: withdrawable } });
           return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
         }
 
-        // ── AGGREGATE: all earned yield for this asset ──
-        const settledBalance = await settleUserYieldForAsset(String(user._id), asset);
-        if (settledBalance <= 0) {
-          return { data: null, error: "Nothing to withdraw", message: "No yield earned to withdraw yet", status: 400 };
-        }
+        // ── AGGREGATE yield (top "Yield" card) ──
+        const dupAgg = await WithdrawRequestModel.findOne({ userId: user._id, source: "yield", asset: asset2, depositId: null, status: "pending" });
+        if (dupAgg)
+          return { data: null, error: "Duplicate", message: "A yield withdrawal is already processing", status: 400 };
+
+        const walletField = asset2 === "USDT" ? "yieldWalletUSDT" : "yieldWalletUSDC";
+        const bal = Number((user as any)[walletField] || 0);
+        if (bal < 1e-6)
+          return { data: null, error: "Nothing to withdraw", message: "No yield to withdraw yet", status: 400 };
+
         const request = await WithdrawRequestModel.create({
           userId: user._id,
-          amount: settledBalance,
-          asset,
+          amount: bal,
+          asset: asset2,
           walletAddress,
-          source,
+          source: "yield",
         });
-        await UserModel.findByIdAndUpdate(user._id, { $inc: { [balanceField]: -settledBalance } });
         return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
-      } else if (source === "referral") {
-        balanceField = "referralEarnings";
-      } else
-        return {
-          data: null,
-          error: "Invalid source",
-          message: "Invalid withdrawal source",
-          status: 400,
-        };
-
-      if ((user as any)[balanceField] < amount) {
-        return {
-          data: null,
-          error: "Insufficient",
-          message: "Insufficient balance",
-          status: 400,
-        };
       }
 
-      const request = await WithdrawRequestModel.create({
-        userId: user._id,
-        amount,
-        asset,
-        walletAddress,
-        source,
-      });
+      if (source === "referral") {
+        const dupRef = await WithdrawRequestModel.findOne({ userId: user._id, source: "referral", status: "pending" });
+        if (dupRef)
+          return { data: null, error: "Duplicate", message: "A referral withdrawal is already processing", status: 400 };
+        const bal = Number((user as any).referralEarnings || 0);
+        if (amount <= 0 || amount > bal)
+          return { data: null, error: "Insufficient", message: "Insufficient balance", status: 400 };
+        const request = await WithdrawRequestModel.create({
+          userId: user._id,
+          amount,
+          asset,
+          walletAddress,
+          source: "referral",
+        });
+        return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
+      }
 
-      // Deduct from balance immediately (pending state)
-      await UserModel.findByIdAndUpdate(user._id, {
-        $inc: { [balanceField]: -amount },
-      });
-
-      return {
-        data: request,
-        error: null,
-        message: "Withdrawal request submitted",
-        status: 201,
-      };
+      return { data: null, error: "Invalid source", message: "Invalid withdrawal source", status: 400 };
     } catch (err: any) {
       return { data: null, error: err.message, message: "Error", status: 500 };
     }

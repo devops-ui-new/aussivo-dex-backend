@@ -11,6 +11,7 @@ import { PORT, APY_CRON_SCHEDULE, ENVIRONMENT } from './configs/constants';
 import { distributeMonthlyAPY } from './helpers/apyDistribution.helper';
 import { depositListener } from './services/depositListener.service';
 import { startEphemeralDepositSweep } from './services/ephemeralDepositSweep.service';
+import { startTronDepositSweep } from './services/tronDepositSweep.service';
 import Routes from './routes';
 import logger from './configs/logger.config';
 import { sendResponse } from './utils/response.util';
@@ -72,6 +73,7 @@ connectDB(async (mongooseConn) => {
       logger.error('[DepositListener] Startup error:', err.message);
     });
     startEphemeralDepositSweep();
+    startTronDepositSweep();
   }
 
   // ── Start Server ──

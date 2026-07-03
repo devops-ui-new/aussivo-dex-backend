@@ -39,12 +39,67 @@ function creditRecordTxHash(requestId: string): string {
 
 function getProvider(): ethers.JsonRpcProvider {
   if (!provider) {
-    provider = new ethers.JsonRpcProvider(BSC_PROVIDER_URL, BSC_CHAIN_ID, { staticNetwork: true });
+    // Primary endpoint = first URL in BSC_PROVIDER_URL (used for the signer / write path).
+    const primary = BSC_PROVIDER_URL.split(",").map((s) => s.trim()).filter(Boolean)[0] || BSC_PROVIDER_URL;
+    provider = new ethers.JsonRpcProvider(primary, BSC_CHAIN_ID, { staticNetwork: true });
     provider.on("error", (err) => {
       logger.error(`[EphemeralSweep] RPC error: ${(err as Error)?.message || err}`);
     });
   }
   return provider;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const GETLOGS_ATTEMPTS = 3;
+
+/**
+ * Read-only providers for log scans. `BSC_PROVIDER_URL` may be a comma-separated list of
+ * endpoints; we try them in order so one flaky public node doesn't break depositor attribution.
+ * These are NEVER used to sign/broadcast — the write path uses getProvider() only.
+ */
+let readProviders: ethers.JsonRpcProvider[] | null = null;
+function getReadProviders(): ethers.JsonRpcProvider[] {
+  if (!readProviders) {
+    const urls = BSC_PROVIDER_URL.split(",").map((s) => s.trim()).filter(Boolean);
+    const list = urls.length ? urls : ["https://bsc-dataseed1.binance.org"];
+    readProviders = list.map((u) => new ethers.JsonRpcProvider(u, BSC_CHAIN_ID, { staticNetwork: true }));
+  }
+  return readProviders;
+}
+
+/**
+ * getLogs that survives flaky public RPCs: retries each endpoint, falls back across endpoints,
+ * and on persistent failure splits the block range in half and recurses (handles -32005 "limit
+ * exceeded" as well as transient "could not coalesce" errors). Throws only if every path fails.
+ */
+async function getLogsResilient(
+  filter: { address: string; topics: (string | null)[] },
+  fromBlock: number,
+  toBlock: number,
+  depth = 0
+): Promise<ethers.Log[]> {
+  const providers = getReadProviders();
+  let lastErr: any;
+  for (const prov of providers) {
+    for (let attempt = 0; attempt < GETLOGS_ATTEMPTS; attempt++) {
+      try {
+        return await prov.getLogs({ ...filter, fromBlock, toBlock });
+      } catch (e: any) {
+        lastErr = e;
+        await sleep(150 * (attempt + 1));
+      }
+    }
+  }
+  // Every endpoint/retry failed — split the range and try the halves (guards against range limits).
+  if (toBlock > fromBlock && depth < 14) {
+    const mid = Math.floor((fromBlock + toBlock) / 2);
+    const [left, right] = await Promise.all([
+      getLogsResilient(filter, fromBlock, mid, depth + 1),
+      getLogsResilient(filter, mid + 1, toBlock, depth + 1),
+    ]);
+    return [...left, ...right];
+  }
+  throw lastErr;
 }
 
 export async function fundEphemeralGas(ephemeralAddress: string): Promise<string> {
@@ -136,12 +191,11 @@ async function findDepositorAddressesForWindow(params: {
   for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += GETLOGS_CHUNK_BLOCKS) {
     const chunkEnd = Math.min(chunkStart + GETLOGS_CHUNK_BLOCKS - 1, toBlock);
     try {
-      const logs = await p.getLogs({
-        address: tokenAddr,
-        topics: [TRANSFER_TOPIC, null, topicTo],
-        fromBlock: chunkStart,
-        toBlock: chunkEnd,
-      });
+      const logs = await getLogsResilient(
+        { address: tokenAddr, topics: [TRANSFER_TOPIC, null, topicTo] },
+        chunkStart,
+        chunkEnd
+      );
       for (const log of logs) {
         const fromTopic = log.topics?.[1];
         if (!fromTopic || fromTopic.length !== 66) continue;
@@ -151,7 +205,9 @@ async function findDepositorAddressesForWindow(params: {
       }
     } catch (e: any) {
       const msg = e?.shortMessage || e?.message || String(e);
-      logger.warn(`[EphemeralSweep] getLogs chunk ${chunkStart}-${chunkEnd} failed: ${msg}`);
+      // Depositor-attribution only — funds are credited/swept via balanceOf, so this does NOT
+      // affect the deposit or the sweep. Worst case the sender address isn't recorded.
+      logger.warn(`[EphemeralSweep] depositor-attribution getLogs ${chunkStart}-${chunkEnd} failed (non-fund-critical): ${msg}`);
     }
   }
   return [...seen];
@@ -161,7 +217,7 @@ async function findDepositorAddressesForWindow(params: {
  * Credit user + vault as soon as USDT is on the ephemeral address (before treasury sweep).
  * Idempotent via unique `pendingRequestId` on deposits.
  */
-async function applyDepositAccounting(
+export async function applyDepositAccounting(
   pending: { _id: any; userId: any; vaultId: any; expectedAmount: number; asset: string; requestId: string; ephemeralAddress?: string },
   opts?: { settledAmount?: number; depositorAddresses?: string[]; skipConfirmationEmail?: boolean }
 ): Promise<void> {
