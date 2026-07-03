@@ -40,10 +40,17 @@ function creditRecordTxHash(requestId: string): string {
 function getProvider(): ethers.JsonRpcProvider {
   if (!provider) {
     // Primary endpoint = first URL in BSC_PROVIDER_URL (used for the signer / write path).
-    const primary = BSC_PROVIDER_URL.split(",").map((s) => s.trim()).filter(Boolean)[0] || BSC_PROVIDER_URL;
-    provider = new ethers.JsonRpcProvider(primary, BSC_CHAIN_ID, { staticNetwork: true });
+    const primary =
+      BSC_PROVIDER_URL.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)[0] || BSC_PROVIDER_URL;
+    provider = new ethers.JsonRpcProvider(primary, BSC_CHAIN_ID, {
+      staticNetwork: true,
+    });
     provider.on("error", (err) => {
-      logger.error(`[EphemeralSweep] RPC error: ${(err as Error)?.message || err}`);
+      logger.error(
+        `[EphemeralSweep] RPC error: ${(err as Error)?.message || err}`,
+      );
     });
   }
   return provider;
@@ -60,9 +67,14 @@ const GETLOGS_ATTEMPTS = 3;
 let readProviders: ethers.JsonRpcProvider[] | null = null;
 function getReadProviders(): ethers.JsonRpcProvider[] {
   if (!readProviders) {
-    const urls = BSC_PROVIDER_URL.split(",").map((s) => s.trim()).filter(Boolean);
+    const urls = BSC_PROVIDER_URL.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     const list = urls.length ? urls : ["https://bsc-dataseed1.binance.org"];
-    readProviders = list.map((u) => new ethers.JsonRpcProvider(u, BSC_CHAIN_ID, { staticNetwork: true }));
+    readProviders = list.map(
+      (u) =>
+        new ethers.JsonRpcProvider(u, BSC_CHAIN_ID, { staticNetwork: true }),
+    );
   }
   return readProviders;
 }
@@ -76,7 +88,7 @@ async function getLogsResilient(
   filter: { address: string; topics: (string | null)[] },
   fromBlock: number,
   toBlock: number,
-  depth = 0
+  depth = 0,
 ): Promise<ethers.Log[]> {
   const providers = getReadProviders();
   let lastErr: any;
@@ -102,17 +114,26 @@ async function getLogsResilient(
   throw lastErr;
 }
 
-export async function fundEphemeralGas(ephemeralAddress: string): Promise<string> {
+export async function fundEphemeralGas(
+  ephemeralAddress: string,
+): Promise<string> {
   if (!GAS_FUNDER_PRIVATE_KEY || !ethers.isAddress(ephemeralAddress)) return "";
   try {
     const p = getProvider();
     const funder = new ethers.Wallet(GAS_FUNDER_PRIVATE_KEY, p);
-    const tx = await funder.sendTransaction({ to: ephemeralAddress, value: GAS_TOPUP_WEI });
+    const tx = await funder.sendTransaction({
+      to: ephemeralAddress,
+      value: GAS_TOPUP_WEI,
+    });
     await tx.wait(1);
-    logger.info(`[EphemeralSweep] Gas funded ${ephemeralAddress} tx=${tx.hash}`);
+    logger.info(
+      `[EphemeralSweep] Gas funded ${ephemeralAddress} tx=${tx.hash}`,
+    );
     return tx.hash;
   } catch (e: any) {
-    logger.warn(`[EphemeralSweep] Gas fund failed for ${ephemeralAddress}: ${e?.message || e}`);
+    logger.warn(
+      `[EphemeralSweep] Gas fund failed for ${ephemeralAddress}: ${e?.message || e}`,
+    );
     return "";
   }
 }
@@ -168,7 +189,9 @@ async function findDepositorAddressesForWindow(params: {
   const fromSec = Math.floor(Number(params.fromMs) / 1000);
   const toSec = Math.floor(Number(params.toMs) / 1000);
   if (!Number.isFinite(fromSec) || !Number.isFinite(toSec)) {
-    logger.warn("[EphemeralSweep] Depositor log window has invalid timestamps; skipping log scan");
+    logger.warn(
+      "[EphemeralSweep] Depositor log window has invalid timestamps; skipping log scan",
+    );
     return [];
   }
 
@@ -179,7 +202,7 @@ async function findDepositorAddressesForWindow(params: {
   const span = toBlock - fromBlock + 1;
   if (span > GETLOGS_MAX_BLOCK_SPAN) {
     logger.warn(
-      `[EphemeralSweep] Depositor log window spans ${span} blocks (${fromBlock}→${toBlock}); clamping to last ${GETLOGS_MAX_BLOCK_SPAN} blocks`
+      `[EphemeralSweep] Depositor log window spans ${span} blocks (${fromBlock}→${toBlock}); clamping to last ${GETLOGS_MAX_BLOCK_SPAN} blocks`,
     );
     fromBlock = Math.max(1, toBlock - GETLOGS_MAX_BLOCK_SPAN + 1);
   }
@@ -188,13 +211,17 @@ async function findDepositorAddressesForWindow(params: {
   const tokenAddr = ethers.getAddress(params.tokenAddress);
   const topicTo = topicAddress(toNorm);
 
-  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += GETLOGS_CHUNK_BLOCKS) {
+  for (
+    let chunkStart = fromBlock;
+    chunkStart <= toBlock;
+    chunkStart += GETLOGS_CHUNK_BLOCKS
+  ) {
     const chunkEnd = Math.min(chunkStart + GETLOGS_CHUNK_BLOCKS - 1, toBlock);
     try {
       const logs = await getLogsResilient(
         { address: tokenAddr, topics: [TRANSFER_TOPIC, null, topicTo] },
         chunkStart,
-        chunkEnd
+        chunkEnd,
       );
       for (const log of logs) {
         const fromTopic = log.topics?.[1];
@@ -207,7 +234,9 @@ async function findDepositorAddressesForWindow(params: {
       const msg = e?.shortMessage || e?.message || String(e);
       // Depositor-attribution only — funds are credited/swept via balanceOf, so this does NOT
       // affect the deposit or the sweep. Worst case the sender address isn't recorded.
-      logger.warn(`[EphemeralSweep] depositor-attribution getLogs ${chunkStart}-${chunkEnd} failed (non-fund-critical): ${msg}`);
+      logger.warn(
+        `[EphemeralSweep] depositor-attribution getLogs ${chunkStart}-${chunkEnd} failed (non-fund-critical): ${msg}`,
+      );
     }
   }
   return [...seen];
@@ -218,10 +247,24 @@ async function findDepositorAddressesForWindow(params: {
  * Idempotent via unique `pendingRequestId` on deposits.
  */
 export async function applyDepositAccounting(
-  pending: { _id: any; userId: any; vaultId: any; expectedAmount: number; asset: string; requestId: string; ephemeralAddress?: string },
-  opts?: { settledAmount?: number; depositorAddresses?: string[]; skipConfirmationEmail?: boolean }
+  pending: {
+    _id: any;
+    userId: any;
+    vaultId: any;
+    expectedAmount: number;
+    asset: string;
+    requestId: string;
+    ephemeralAddress?: string;
+  },
+  opts?: {
+    settledAmount?: number;
+    depositorAddresses?: string[];
+    skipConfirmationEmail?: boolean;
+  },
 ): Promise<void> {
-  const dup = await DepositModel.findOne({ pendingRequestId: pending.requestId });
+  const dup = await DepositModel.findOne({
+    pendingRequestId: pending.requestId,
+  });
   if (dup) return;
 
   const user = await UserModel.findById(pending.userId);
@@ -235,7 +278,9 @@ export async function applyDepositAccounting(
 
   const amount = Number(opts?.settledAmount ?? pending.expectedAmount);
   const symbol = pending.asset;
-  const depositorAddresses = (opts?.depositorAddresses || []).map((a) => normalizeAddr(a)).filter(Boolean);
+  const depositorAddresses = (opts?.depositorAddresses || [])
+    .map((a) => normalizeAddr(a))
+    .filter(Boolean);
 
   let tierIndex = 0;
   let apyPercent = vault.tiers[0]?.apyPercent || 0;
@@ -247,7 +292,10 @@ export async function applyDepositAccounting(
     }
   }
 
-  const lockUntil = vault.lockDays > 0 ? new Date(Date.now() + vault.lockDays * 86400000) : null;
+  const lockUntil =
+    vault.lockDays > 0
+      ? new Date(Date.now() + vault.lockDays * 86400000)
+      : null;
   const recordHash = creditRecordTxHash(pending.requestId);
 
   let deposit;
@@ -259,7 +307,9 @@ export async function applyDepositAccounting(
       asset: symbol,
       txHash: recordHash,
       pendingRequestId: pending.requestId,
-      walletAddress: depositorAddresses[0] || String(pending.ephemeralAddress || "").toLowerCase(),
+      walletAddress:
+        depositorAddresses[0] ||
+        String(pending.ephemeralAddress || "").toLowerCase(),
       depositorAddresses,
       lockUntil,
       apyPercent,
@@ -282,7 +332,9 @@ export async function applyDepositAccounting(
   });
 
   if (depositorAddresses.length) {
-    const known = (user.walletAddresses || []).map((w: string) => normalizeAddr(w)).filter(Boolean);
+    const known = (user.walletAddresses || [])
+      .map((w: string) => normalizeAddr(w))
+      .filter(Boolean);
     const uniqueIncoming = depositorAddresses.filter((a) => !known.includes(a));
     if (uniqueIncoming.length) {
       const available: string[] = [];
@@ -296,7 +348,9 @@ export async function applyDepositAccounting(
       if (available.length) {
         await UserModel.findByIdAndUpdate(user._id, {
           $addToSet: { walletAddresses: { $each: available } },
-          ...(user.walletAddress ? {} : { $set: { walletAddress: available[0] } }),
+          ...(user.walletAddress
+            ? {}
+            : { $set: { walletAddress: available[0] } }),
         });
       }
     }
@@ -322,30 +376,46 @@ export async function applyDepositAccounting(
   const monthlyYield = ((amount * (apyPercent / 12)) / 100).toFixed(2);
   if (!opts?.skipConfirmationEmail) {
     try {
-      await sendEmail(user.email, "✅ Deposit Confirmed — Aussivo.DEX", "deposit-confirmation", {
-        name: user.name,
-        amount: amount.toFixed(2),
-        asset: symbol,
-        vaultName: vault.name,
-        apyPercent: apyPercent.toFixed(1),
-        apyMonthly,
-        monthlyYield,
-        lockDays: vault.lockDays,
-        txHash: recordHash,
-        txHashShort: "Sweep pending — check Portfolio",
-        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
-      });
+      await sendEmail(
+        user.email,
+        "✅ Deposit Confirmed — Aussivo.DEX",
+        "deposit-confirmation",
+        {
+          name: user.name,
+          amount: amount.toFixed(2),
+          asset: symbol,
+          vaultName: vault.name,
+          apyPercent: apyPercent.toFixed(1),
+          apyMonthly,
+          monthlyYield,
+          lockDays: vault.lockDays,
+          txHash: recordHash,
+          txHashShort: "Sweep pending — check Portfolio",
+          date: new Date().toLocaleDateString("en-US", {
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+          }),
+        },
+      );
     } catch (e: any) {
       logger.warn(`[EphemeralSweep] Email failed: ${e?.message}`);
     }
   } else {
-    logger.info(`[EphemeralSweep] Skipping deposit-confirmation email (partial vs intent) for ${user.email}`);
+    logger.info(
+      `[EphemeralSweep] Skipping deposit-confirmation email (partial vs intent) for ${user.email}`,
+    );
   }
 
-  logger.info(`[EphemeralSweep] Credited user ${user.email} ${amount} ${symbol} (requestId=${pending.requestId.slice(0, 10)}…)`);
+  logger.info(
+    `[EphemeralSweep] Credited user ${user.email} ${amount} ${symbol} (requestId=${pending.requestId.slice(0, 10)}…)`,
+  );
 }
 
-function tierApyForDepositAmount(amount: number, vault: { tiers?: { minAmount: number; apyPercent: number }[] }): number {
+function tierApyForDepositAmount(
+  amount: number,
+  vault: { tiers?: { minAmount: number; apyPercent: number }[] },
+): number {
   const tiers = vault.tiers || [];
   let apyPercent = tiers[0]?.apyPercent || 0;
   for (let i = tiers.length - 1; i >= 0; i--) {
@@ -357,7 +427,10 @@ function tierApyForDepositAmount(amount: number, vault: { tiers?: { minAmount: n
   return apyPercent;
 }
 
-async function revertIncomingFundsWatermark(id: unknown, prevStrForRevert: string): Promise<void> {
+async function revertIncomingFundsWatermark(
+  id: unknown,
+  prevStrForRevert: string,
+): Promise<void> {
   if (!prevStrForRevert) {
     await PendingDepositModel.findByIdAndUpdate(id, {
       $set: { incomingFundsLastNotifiedBalanceBaseUnits: "" },
@@ -377,12 +450,17 @@ async function tryNotifyIncomingFundsDuringWindow(
   doc: any,
   bal: bigint,
   expectedBn: bigint,
-  tokenAddr: string
+  tokenAddr: string,
 ): Promise<void> {
-  const lastStr = String(doc.incomingFundsLastNotifiedBalanceBaseUnits ?? "").trim();
+  const lastStr = String(
+    doc.incomingFundsLastNotifiedBalanceBaseUnits ?? "",
+  ).trim();
   // Migration: older rows only had incomingFundsNotifiedAt — advance watermark without re-mailing.
   if (!lastStr && doc.incomingFundsNotifiedAt) {
-    await PendingDepositModel.updateOne({ _id: doc._id }, { $set: { incomingFundsLastNotifiedBalanceBaseUnits: bal.toString() } });
+    await PendingDepositModel.updateOne(
+      { _id: doc._id },
+      { $set: { incomingFundsLastNotifiedBalanceBaseUnits: bal.toString() } },
+    );
     return;
   }
 
@@ -447,8 +525,12 @@ async function tryNotifyIncomingFundsDuringWindow(
   const cumulativeNum = Number(ethers.formatUnits(bal, decimals));
   const incrementNum = Number(ethers.formatUnits(incrementBn, decimals));
   const incrementFormatted = incrementNum.toFixed(2);
-  const receivedAmount = parseFloat(ethers.formatUnits(bal, decimals)).toFixed(2);
-  const expectedAmount = parseFloat(ethers.formatUnits(expectedBn, decimals)).toFixed(2);
+  const receivedAmount = parseFloat(ethers.formatUnits(bal, decimals)).toFixed(
+    2,
+  );
+  const expectedAmount = parseFloat(
+    ethers.formatUnits(expectedBn, decimals),
+  ).toFixed(2);
 
   const vaultName = (vault as { name?: string }).name || "Vault";
   const apyPercent = tierApyForDepositAmount(cumulativeNum, vault as any);
@@ -466,7 +548,10 @@ async function tryNotifyIncomingFundsDuringWindow(
 
   try {
     if (bal < expectedBn) {
-      const subject = prev === null ? "Funds received — Aussivo.DEX" : "Additional funds received — Aussivo.DEX";
+      const subject =
+        prev === null
+          ? "Funds received — Aussivo.DEX"
+          : "Additional funds received — Aussivo.DEX";
       const ok = await sendEmail(user.email, subject, "deposit-confirmation", {
         incomingPartial: true,
         isAdditionalTransfer: prev !== null,
@@ -478,32 +563,54 @@ async function tryNotifyIncomingFundsDuringWindow(
         apyMonthly,
         monthlyYield,
         lockDays: (vault as any).lockDays,
-        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
+        date: new Date().toLocaleDateString("en-US", {
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+        }),
       });
       if (!ok) throw new Error("email not sent (SMTP disabled or send failed)");
-      logger.info(`[EphemeralSweep] Partial window email (${subject}) → ${user.email} increment=${incrementFormatted}`);
+      logger.info(
+        `[EphemeralSweep] Partial window email (${subject}) → ${user.email} increment=${incrementFormatted}`,
+      );
     } else {
-      const monthlyYieldFull = ((cumulativeNum * (apyPercent / 12)) / 100).toFixed(2);
-      const ok = await sendEmail(user.email, "Incoming transfer detected — Aussivo.DEX", "deposit-confirmation", {
-        incomingFullWindow: true,
-        name: user.name || "",
-        amount: receivedAmount,
-        expectedAmount,
-        asset: doc.asset,
-        vaultName,
-        apyPercent: apyPercent.toFixed(1),
-        apyMonthly,
-        monthlyYield: monthlyYieldFull,
-        lockDays: (vault as any).lockDays,
-        expiresAtFormatted,
-        date: new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" }),
-      });
+      const monthlyYieldFull = (
+        (cumulativeNum * (apyPercent / 12)) /
+        100
+      ).toFixed(2);
+      const ok = await sendEmail(
+        user.email,
+        "Incoming transfer detected — Aussivo.DEX",
+        "deposit-confirmation",
+        {
+          incomingFullWindow: true,
+          name: user.name || "",
+          amount: receivedAmount,
+          expectedAmount,
+          asset: doc.asset,
+          vaultName,
+          apyPercent: apyPercent.toFixed(1),
+          apyMonthly,
+          monthlyYield: monthlyYieldFull,
+          lockDays: (vault as any).lockDays,
+          expiresAtFormatted,
+          date: new Date().toLocaleDateString("en-US", {
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+          }),
+        },
+      );
       if (!ok) throw new Error("email not sent (SMTP disabled or send failed)");
-      logger.info(`[EphemeralSweep] Full expected amount on-chain — deposit-confirmation → ${user.email}`);
+      logger.info(
+        `[EphemeralSweep] Full expected amount on-chain — deposit-confirmation → ${user.email}`,
+      );
     }
   } catch (e: any) {
     await revertIncomingFundsWatermark(doc._id, prevStrForRevert);
-    logger.warn(`[EphemeralSweep] Incoming window email failed for ${doc._id}: ${e?.message || e}`);
+    logger.warn(
+      `[EphemeralSweep] Incoming window email failed for ${doc._id}: ${e?.message || e}`,
+    );
   }
 }
 
@@ -534,7 +641,7 @@ async function sweepOne(pendingArg: any): Promise<void> {
       if (bal > 0n) {
         await tryNotifyIncomingFundsDuringWindow(doc, bal, expected, tokenAddr);
         logger.info(
-          `[EphemeralSweep] Tracking ${ephemeral}: currentBalance=${bal.toString()} expected=${expected.toString()} until=${new Date(expiresMs).toISOString()}`
+          `[EphemeralSweep] Tracking ${ephemeral}: currentBalance=${bal.toString()} expected=${expected.toString()} until=${new Date(expiresMs).toISOString()}`,
         );
       }
       return;
@@ -542,8 +649,15 @@ async function sweepOne(pendingArg: any): Promise<void> {
 
     if (bal === 0n) {
       // Nothing arrived. Expire only once the address validity window has passed.
-      if (!isWindowOpen && doc.status === "pending" && !doc.userCreditedAt && !doc.sweepTxHash) {
-        await PendingDepositModel.findByIdAndUpdate(doc._id, { status: "expired" });
+      if (
+        !isWindowOpen &&
+        doc.status === "pending" &&
+        !doc.userCreditedAt &&
+        !doc.sweepTxHash
+      ) {
+        await PendingDepositModel.findByIdAndUpdate(doc._id, {
+          status: "expired",
+        });
         logger.info(`[EphemeralSweep] Expired empty intent ${doc.requestId}`);
       }
       return;
@@ -572,7 +686,7 @@ async function sweepOne(pendingArg: any): Promise<void> {
             depositorAddresses,
           },
         },
-        { new: true }
+        { new: true },
       );
       if (transitioned) {
         try {
@@ -583,7 +697,9 @@ async function sweepOne(pendingArg: any): Promise<void> {
             skipConfirmationEmail,
           });
         } catch (err: any) {
-          logger.error(`[EphemeralSweep] Credit accounting failed ${doc._id}: ${err?.message || err}`);
+          logger.error(
+            `[EphemeralSweep] Credit accounting failed ${doc._id}: ${err?.message || err}`,
+          );
           await PendingDepositModel.findByIdAndUpdate(doc._id, {
             $set: { status: "pending", userCreditedAt: null },
           });
@@ -592,7 +708,10 @@ async function sweepOne(pendingArg: any): Promise<void> {
       }
     } else if (depositorAddresses.length) {
       await PendingDepositModel.findByIdAndUpdate(doc._id, {
-        $set: { receivedAmount: settledAmount, receivedAmountBaseUnits: bal.toString() },
+        $set: {
+          receivedAmount: settledAmount,
+          receivedAmountBaseUnits: bal.toString(),
+        },
         $addToSet: { depositorAddresses: { $each: depositorAddresses } },
       });
       await DepositModel.findOneAndUpdate(
@@ -600,7 +719,7 @@ async function sweepOne(pendingArg: any): Promise<void> {
         {
           $set: { amount: settledAmount },
           $addToSet: { depositorAddresses: { $each: depositorAddresses } },
-        }
+        },
       );
     }
 
@@ -609,18 +728,26 @@ async function sweepOne(pendingArg: any): Promise<void> {
       return;
     }
 
-    if (!TREASURY_WALLET_ADDRESS || !ethers.isAddress(TREASURY_WALLET_ADDRESS)) {
+    if (
+      !TREASURY_WALLET_ADDRESS ||
+      !ethers.isAddress(TREASURY_WALLET_ADDRESS)
+    ) {
       logger.error(
-        `[EphemeralSweep] TREASURY_WALLET_ADDRESS missing — user already credited; holding encrypted key for ${ephemeral} until treasury is configured.`
+        `[EphemeralSweep] TREASURY_WALLET_ADDRESS missing — user already credited; holding encrypted key for ${ephemeral} until treasury is configured.`,
       );
       return;
     }
 
     let pk: string;
     try {
-      pk = decryptPrivateKeyHex(latest.privateKeyEncrypted, EPHEMERAL_WALLET_SECRET);
+      pk = decryptPrivateKeyHex(
+        latest.privateKeyEncrypted,
+        EPHEMERAL_WALLET_SECRET,
+      );
     } catch (e: any) {
-      logger.error(`[EphemeralSweep] Decrypt failed for ${latest._id}: ${e?.message}`);
+      logger.error(
+        `[EphemeralSweep] Decrypt failed for ${latest._id}: ${e?.message}`,
+      );
       return;
     }
 
@@ -633,13 +760,15 @@ async function sweepOne(pendingArg: any): Promise<void> {
     const erc20Write = new ethers.Contract(tokenAddr, ERC20_ABI, wallet);
     let bnbBal = await p.getBalance(ephemeral);
     if (bnbBal < 80_000_000_000_000n) {
-      logger.warn(`[EphemeralSweep] Low BNB on ${ephemeral} (${bnbBal.toString()} wei) — attempting gas top-up`);
+      logger.warn(
+        `[EphemeralSweep] Low BNB on ${ephemeral} (${bnbBal.toString()} wei) — attempting gas top-up`,
+      );
       await fundEphemeralGas(ephemeral);
       bnbBal = await p.getBalance(ephemeral);
     }
     if (bnbBal < 30_000_000_000_000n) {
       logger.warn(
-        `[EphemeralSweep] Cannot sweep yet ${ephemeral}: insufficient BNB for gas. Encrypted key retained; will retry. Set GAS_FUNDER_PRIVATE_KEY or fund BNB on this address.`
+        `[EphemeralSweep] Cannot sweep yet ${ephemeral}: insufficient BNB for gas. Encrypted key retained; will retry. Set GAS_FUNDER_PRIVATE_KEY or fund BNB on this address.`,
       );
       return;
     }
@@ -650,10 +779,12 @@ async function sweepOne(pendingArg: any): Promise<void> {
     }
 
     logger.info(
-      `[EphemeralSweep] Sweeping ${bal.toString()} wei ${latest.asset} from ${ephemeral} → treasury (settled=${bal.toString()})`
+      `[EphemeralSweep] Sweeping ${bal.toString()} wei ${latest.asset} from ${ephemeral} → treasury (settled=${bal.toString()})`,
     );
 
-    const tx = await erc20Write.transfer(TREASURY_WALLET_ADDRESS, bal, { gasLimit: 150_000n });
+    const tx = await erc20Write.transfer(TREASURY_WALLET_ADDRESS, bal, {
+      gasLimit: 150_000n,
+    });
     const receipt = await tx.wait(1);
     if (receipt?.status === 0) {
       logger.error(`[EphemeralSweep] Sweep tx reverted: ${tx.hash}`);
@@ -668,7 +799,7 @@ async function sweepOne(pendingArg: any): Promise<void> {
 
     await DepositModel.findOneAndUpdate(
       { pendingRequestId: latest.requestId },
-      { $set: { txHash: sweepTxHash } }
+      { $set: { txHash: sweepTxHash } },
     );
 
     await PendingDepositModel.findByIdAndUpdate(latest._id, {
@@ -682,9 +813,13 @@ async function sweepOne(pendingArg: any): Promise<void> {
       $unset: { privateKeyEncrypted: "" },
     });
 
-    logger.info(`[EphemeralSweep] Swept + purged key material for ${ephemeral} tx=${sweepTxHash}`);
+    logger.info(
+      `[EphemeralSweep] Swept + purged key material for ${ephemeral} tx=${sweepTxHash}`,
+    );
   } catch (err: any) {
-    logger.error(`[EphemeralSweep] Error processing ${pendingArg._id}: ${err?.message || err}`);
+    logger.error(
+      `[EphemeralSweep] Error processing ${pendingArg._id}: ${err?.message || err}`,
+    );
   } finally {
     processing.delete(id);
   }
@@ -695,6 +830,7 @@ async function tick() {
     const pendings = await PendingDepositModel.find({
       status: { $in: ["pending", "credited"] },
       ephemeralAddress: { $exists: true, $nin: [null, ""] },
+      network: { $ne: "trc20" }, // Tron deposits are handled by tronDepositSweep — never ethers-decode base58
     })
       .limit(50)
       .lean();
@@ -711,10 +847,12 @@ let intervalId: ReturnType<typeof setInterval> | null = null;
 export function startEphemeralDepositSweep() {
   if (intervalId) return;
   if (TREASURY_WALLET_ADDRESS) {
-    logger.info(`[EphemeralSweep] Treasury loaded ${TREASURY_WALLET_ADDRESS.slice(0, 8)}…${TREASURY_WALLET_ADDRESS.slice(-4)}`);
+    logger.info(
+      `[EphemeralSweep] Treasury loaded ${TREASURY_WALLET_ADDRESS.slice(0, 8)}…${TREASURY_WALLET_ADDRESS.slice(-4)}`,
+    );
   } else {
     logger.warn(
-      "[EphemeralSweep] Treasury address missing — users can still be credited; sweeps wait until TREASURY_WALLET_ADDRESS is set."
+      "[EphemeralSweep] Treasury address missing — users can still be credited; sweeps wait until TREASURY_WALLET_ADDRESS is set.",
     );
   }
   logger.info("[EphemeralSweep] Starting interval (every 15s)");

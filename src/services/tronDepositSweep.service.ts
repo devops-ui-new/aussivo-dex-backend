@@ -54,6 +54,9 @@ export function isTronAddress(addr: string): boolean {
 
 /** Human-readable USDT balance on a Tron address. */
 async function getUsdtBalance(tron: TronWeb, address: string): Promise<number> {
+  // TronWeb needs an owner_address set even for constant (read-only) calls, else TronGrid
+  // rejects with "owner_address isn't set". Use the address being queried.
+  tron.setAddress(address);
   const contract = await tron.contract().at(TRON_USDT_CONTRACT);
   const raw = await contract.balanceOf(address).call();
   return Number(raw.toString()) / UNIT;
