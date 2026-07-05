@@ -21,6 +21,8 @@ import {
   BSC_CHAIN_ID,
   BSC_PROVIDER_URL,
   EPHEMERAL_WALLET_SECRET,
+  REFERRAL_L1_PERCENT,
+  REFERRAL_L2_PERCENT,
   TRON_TREASURY_ADDRESS,
   TRON_USDT_CONTRACT,
 } from "../configs/constants";
@@ -968,12 +970,12 @@ export default class UserController {
           l1: {
             count: l1Referrals.length,
             users: l1Referrals,
-            commissionRate: "0.35%",
+            commissionRate: `${REFERRAL_L1_PERCENT}%`,
           },
           l2: {
             count: l2Referrals.length,
             users: l2Referrals,
-            commissionRate: "0.15%",
+            commissionRate: `${REFERRAL_L2_PERCENT}%`,
           },
           totalEarnings: user.referralEarnings,
           recentCommissions,

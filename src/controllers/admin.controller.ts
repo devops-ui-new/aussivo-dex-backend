@@ -7,11 +7,14 @@ import VaultModel from '../models/vault.model';
 import DepositModel from '../models/deposit.model';
 import YieldLogModel from '../models/yieldLog.model';
 import WithdrawRequestModel from '../models/withdrawRequest.model';
+import PendingDepositModel from '../models/pendingDeposit.model';
 import ActivityModel from '../models/activity.model';
 import { JWT_SECRET } from '../configs/constants';
 import { IResponse } from '../utils/response.util';
 import { distributeMonthlyAPY } from '../helpers/apyDistribution.helper';
 import { isVaultPayoutConfigured, payoutUserOnChain } from '../services/vaultPayout.service';
+import { getGasFunderStatus, forceSweepPending as forceSweepBep } from '../services/ephemeralDepositSweep.service';
+import { getTronGasFunderStatus, forceSweepPending as forceSweepTron } from '../services/tronDepositSweep.service';
 import logger from '../configs/logger.config';
 
 export default class AdminController {
@@ -65,6 +68,80 @@ export default class AdminController {
       };
     } catch (err: any) {
       return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // ── DEPOSIT SWEEP MONITOR ──
+  // Per-chain view of what's in-flight and whether a gas funder is the bottleneck.
+  async getSweepStatus(): Promise<IResponse> {
+    try {
+      const now = Date.now();
+      const notSwept = { $or: [{ sweepTxHash: "" }, { sweepTxHash: { $exists: false } }] };
+      const STUCK_MS = 3 * 60 * 1000;
+
+      const perChain = async (network: 'bep20' | 'trc20') => {
+        const [awaitingDeposit, awaitingSweep, swept, expired, stuckDocs] = await Promise.all([
+          PendingDepositModel.countDocuments({ network, status: 'pending', expiresAt: { $gt: new Date(now) } }),
+          PendingDepositModel.countDocuments({ network, status: 'credited', ...notSwept }),
+          PendingDepositModel.countDocuments({ network, status: 'matched' }),
+          PendingDepositModel.countDocuments({ network, status: 'expired' }),
+          PendingDepositModel.find({
+            network, status: 'credited', ...notSwept,
+            userCreditedAt: { $lt: new Date(now - STUCK_MS) },
+          }).select('ephemeralAddress asset receivedAmount expectedAmount userCreditedAt energyFundedAt').sort({ userCreditedAt: 1 }).limit(50).lean(),
+        ]);
+        const stuck = stuckDocs.map((d: any) => ({
+          id: String(d._id),
+          address: d.ephemeralAddress,
+          asset: d.asset,
+          amount: d.receivedAmount || d.expectedAmount || 0,
+          waitingMinutes: d.userCreditedAt ? Math.round((now - new Date(d.userCreditedAt).getTime()) / 60000) : null,
+          lastFundedAt: d.energyFundedAt || null,
+        }));
+        return { awaitingDeposit, awaitingSweep, swept, expired, stuckCount: stuck.length, stuck };
+      };
+
+      const [bep20, trc20, bscFunder, tronFunder] = await Promise.all([
+        perChain('bep20'), perChain('trc20'), getGasFunderStatus(), getTronGasFunderStatus(),
+      ]);
+
+      // A funder that's low AND has deposits awaiting sweep = the reason things are stuck.
+      const bscBlocked = bscFunder ? !bscFunder.ok && bep20.awaitingSweep > 0 : bep20.awaitingSweep > 0;
+      const tronBlocked = tronFunder ? !tronFunder.ok && trc20.awaitingSweep > 0 : trc20.awaitingSweep > 0;
+
+      return {
+        data: {
+          generatedAt: new Date(now).toISOString(),
+          bep20: { ...bep20, gasFunder: bscFunder, funderBlocking: bscBlocked },
+          trc20: { ...trc20, gasFunder: tronFunder, funderBlocking: tronBlocked },
+        },
+        error: null, message: 'Sweep status', status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // Admin action: force-process a single stuck deposit now (re-fund gas + sweep).
+  async forceSweep(pendingId: string): Promise<IResponse> {
+    try {
+      const doc = await PendingDepositModel.findById(pendingId);
+      if (!doc) return { data: null, error: 'Not found', message: 'Deposit not found', status: 404 };
+      if (doc.status === 'matched') return { data: { status: 'matched' }, error: null, message: 'Already swept', status: 200 };
+
+      if (doc.network === 'trc20') await forceSweepTron(pendingId);
+      else await forceSweepBep(pendingId);
+
+      const fresh: any = await PendingDepositModel.findById(pendingId).lean();
+      const swept = fresh?.status === 'matched' || !!fresh?.sweepTxHash;
+      return {
+        data: { status: fresh?.status, sweepTxHash: fresh?.sweepTxHash || null, swept },
+        error: null,
+        message: swept ? 'Swept to treasury' : 'Retry triggered — if the gas funder is empty, top it up and retry',
+        status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: `Force sweep failed: ${err.message}`, status: 500 };
     }
   }
 
@@ -207,13 +284,15 @@ export default class AdminController {
         }
 
         await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'completed', txHash: finalTxHash });
-        await UserModel.findByIdAndUpdate(request.userId, { $inc: { totalWithdrawn: request.amount } });
+        // userId may be a populated doc here — resolve to a plain id for the $inc updates.
+        const uid = (request.userId as any)?._id || request.userId;
+        await UserModel.findByIdAndUpdate(uid, { $inc: { totalWithdrawn: request.amount } });
 
         // ── The balance change happens HERE, on approval — never at submit time. ──
         if (request.source === 'deposit' && request.depositId) {
           // Principal redemption: close the deposit and decrement vault TVL.
           const deposit = await DepositModel.findById(request.depositId);
-          if (deposit && (deposit.status === 'active' || deposit.status === 'matured')) {
+          if (deposit && deposit.status !== 'withdrawn') {
             await DepositModel.findByIdAndUpdate(request.depositId, { status: 'withdrawn', withdrawnAt: new Date() });
             await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: -deposit.amount, totalUsers: -1 } });
           }
@@ -223,9 +302,9 @@ export default class AdminController {
         } else if (request.source === 'yield') {
           // Aggregate yield: now debit the yield wallet.
           const f = request.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
-          await UserModel.findByIdAndUpdate(request.userId, { $inc: { [f]: -request.amount } });
+          await UserModel.findByIdAndUpdate(uid, { $inc: { [f]: -request.amount } });
         } else if (request.source === 'referral') {
-          await UserModel.findByIdAndUpdate(request.userId, { $inc: { referralEarnings: -request.amount } });
+          await UserModel.findByIdAndUpdate(uid, { $inc: { referralEarnings: -request.amount } });
         }
 
         await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Approved', type: 'admin', metadata: { requestId, amount: request.amount, txHash: finalTxHash } });

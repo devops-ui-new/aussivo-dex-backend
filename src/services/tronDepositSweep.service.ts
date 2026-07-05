@@ -52,6 +52,17 @@ export function isTronAddress(addr: string): boolean {
   try { return makeTronWeb().isAddress(addr); } catch { return false; }
 }
 
+/** Tron gas-funder TRX balance + whether it can still fund sweeps. For the admin monitor. */
+export async function getTronGasFunderStatus(): Promise<{ address: string; trx: string; ok: boolean } | null> {
+  if (!TRON_GAS_FUNDER_PRIVATE_KEY) return null;
+  try {
+    const tron = makeTronWeb(TRON_GAS_FUNDER_PRIVATE_KEY);
+    const address = tron.address.fromPrivateKey(TRON_GAS_FUNDER_PRIVATE_KEY) as string;
+    const balSun = Number(await tron.trx.getBalance(address));
+    return { address, trx: (balSun / 1e6).toFixed(2), ok: balSun > Number(tron.toSun(TRON_GAS_TOPUP_TRX)) * 3 };
+  } catch { return null; }
+}
+
 /** Human-readable USDT balance on a Tron address. */
 async function getUsdtBalance(tron: TronWeb, address: string): Promise<number> {
   // TronWeb needs an owner_address set even for constant (read-only) calls, else TronGrid
@@ -119,13 +130,25 @@ async function processOne(doc: any): Promise<void> {
   catch { logger.warn(`[TronSweep] decrypt failed for ${address} — cannot sweep`); return; }
 
   // Ensure the ephemeral can pay for the transfer (energy comes from burning TRX).
-  try {
-    const trxBal = await tron.trx.getBalance(address); // in sun
-    if (Number(trxBal) < Number(tron.toSun(TRON_GAS_TOPUP_TRX)) * 0.6) {
-      await fundTronEnergy(address);
-      return; // let the next tick sweep once TRX has landed
+  // CRITICAL: do NOT re-fund on every tick — that drains the gas funder. Fund at most once
+  // per cooldown window, then wait for the TRX to land before attempting the sweep.
+  let trxBalSun = 0;
+  try { trxBalSun = Number(await tron.trx.getBalance(address)); } catch { /* fall through */ }
+  const needSun = Number(tron.toSun(TRON_GAS_TOPUP_TRX)) * 0.6;
+  if (trxBalSun < needSun) {
+    const FUND_COOLDOWN_MS = 3 * 60 * 1000;
+    const lastFund = doc.energyFundedAt ? new Date(doc.energyFundedAt).getTime() : 0;
+    if (Date.now() - lastFund > FUND_COOLDOWN_MS) {
+      const tx = await fundTronEnergy(address);
+      await PendingDepositModel.findByIdAndUpdate(doc._id, {
+        energyFundedAt: new Date(),
+        ...(tx ? { gasFundTxHash: tx } : {}),
+      });
+    } else {
+      logger.info(`[TronSweep] ${address}: waiting for energy TRX to land (funded <3m ago), TRX=${(trxBalSun / 1e6).toFixed(2)}`);
     }
-  } catch { /* if balance check fails, still attempt the sweep below */ }
+    return; // wait for TRX before sweeping
+  }
 
   try {
     const txid = await sweepToTreasury(address, pk, balance);
@@ -170,4 +193,12 @@ export function startTronDepositSweep(): void {
 
 export function stopTronDepositSweep(): void {
   if (timer) { clearInterval(timer); timer = null; }
+}
+
+/** Admin action: immediately re-fund energy and re-run the sweep for one pending deposit (Tron). */
+export async function forceSweepPending(id: string): Promise<void> {
+  // Clear the fund cooldown so a manual retry can top up energy right away.
+  await PendingDepositModel.findByIdAndUpdate(id, { $unset: { energyFundedAt: 1 } });
+  const doc = await PendingDepositModel.findById(id);
+  if (doc) await processOne(doc);
 }

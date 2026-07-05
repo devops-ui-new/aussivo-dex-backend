@@ -39,6 +39,15 @@ router.get('/deposits', authenticateAdmin, async (req: Request, res: Response) =
   const r = await new AdminController(req, res).getAllDeposits(Number(req.query.page) || 1, Number(req.query.limit) || 20, req.query.vaultId as string, req.query.status as string);
   return sendResponse(res, r.status, r);
 });
+// Deposit sweep monitor — in-flight / stuck deposits + gas funder health, per chain
+router.get('/sweep-status', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).getSweepStatus();
+  return sendResponse(res, r.status, r);
+});
+router.post('/sweep-status/force', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).forceSweep(req.body?.pendingId);
+  return sendResponse(res, r.status, r);
+});
 // Withdrawals
 router.get('/withdrawals', authenticateAdmin, async (req: Request, res: Response) => {
   const r = await new AdminController(req, res).getWithdrawRequests(Number(req.query.page) || 1, Number(req.query.limit) || 20, req.query.status as string);
