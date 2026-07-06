@@ -1,6 +1,8 @@
 import express from 'express';
 import userRoutes from './user.routes';
 import adminRoutes from './admin.routes';
+import AdminController from '../controllers/admin.controller';
+import { authenticateReportKey } from '../middlewares/auth.middleware';
 import VaultModel from '../models/vault.model';
 import UserModel from '../models/user.model';
 import DepositModel from '../models/deposit.model';
@@ -11,6 +13,12 @@ const router = express.Router();
 
 router.use('/user', userRoutes);
 router.use('/admin', adminRoutes);
+
+// ── Read-only reports (partner teams) — API-key gated, no admin JWT, GET only ──
+router.get('/reports/treasury-summary', authenticateReportKey, async (req, res) => {
+  const r = await new AdminController(req as any, res as any).getTreasurySummary();
+  return sendResponse(res, r.status, r);
+});
 
 // ═══ Frontend compatibility routes ═══
 

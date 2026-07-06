@@ -145,6 +145,62 @@ export default class AdminController {
     }
   }
 
+  // Aggregate real USDT that landed from users — per chain (BEP-20 / TRC-20) and combined.
+  // sweptToTreasury = reached treasury; inFlight = credited but still on ephemeral (not swept).
+  async getTreasurySummary(): Promise<IResponse> {
+    try {
+      const amountExpr = { $cond: [{ $gt: ['$receivedAmount', 0] }, '$receivedAmount', '$expectedAmount'] };
+      const rows = await PendingDepositModel.aggregate([
+        { $match: { status: { $in: ['credited', 'matched'] } } },
+        { $group: {
+          _id: { network: '$network', status: '$status', asset: '$asset' },
+          amount: { $sum: amountExpr },
+          count: { $sum: 1 },
+        } },
+      ]);
+
+      const blank = () => ({ sweptToTreasury: 0, inFlight: 0, totalReceived: 0, count: 0 });
+      const byChain: any = { bep20: blank(), trc20: blank() };
+      const byAsset: any = { USDT: blank(), USDC: blank() };
+      const combined = blank();
+
+      for (const r of rows) {
+        const net = r._id.network === 'trc20' ? 'trc20' : 'bep20';
+        const asset = r._id.asset === 'USDC' ? 'USDC' : 'USDT';
+        const isSwept = r._id.status === 'matched';
+        const amt = r.amount || 0;
+        const bucket = isSwept ? 'sweptToTreasury' : 'inFlight';
+        for (const t of [byChain[net], byAsset[asset], combined]) {
+          t[bucket] += amt; t.totalReceived += amt; t.count += r.count;
+        }
+      }
+
+      // Off-chain view: what's actually credited to user balances (deposits collection).
+      const [activeAgg, allAgg] = await Promise.all([
+        DepositModel.aggregate([{ $match: { status: 'active' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+        DepositModel.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
+      ]);
+
+      const round = (o: any) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, k === 'count' ? v : Math.round(Number(v) * 1e6) / 1e6]));
+
+      return {
+        data: {
+          generatedAt: new Date().toISOString(),
+          combined: round(combined),
+          byChain: { bep20: round(byChain.bep20), trc20: round(byChain.trc20) },
+          byAsset: { USDT: round(byAsset.USDT), USDC: round(byAsset.USDC) },
+          creditedToUsers: {
+            activePrincipal: Math.round((activeAgg[0]?.total || 0) * 1e6) / 1e6,
+            allTime: Math.round((allAgg[0]?.total || 0) * 1e6) / 1e6,
+          },
+        },
+        error: null, message: 'Treasury summary', status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
   // ── VAULT CRUD ──
   async createVault(body: any): Promise<IResponse> {
     try {

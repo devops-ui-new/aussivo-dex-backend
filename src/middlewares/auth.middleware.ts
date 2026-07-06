@@ -1,7 +1,23 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import { JWT_SECRET, CRON_SECRET } from '../configs/constants';
+import crypto from 'crypto';
+import { JWT_SECRET, CRON_SECRET, REPORTS_API_KEY } from '../configs/constants';
 import { sendResponse } from '../utils/response.util';
+
+// Read-only reports key (partner teams). Timing-safe compare; disabled unless REPORTS_API_KEY is set.
+export const authenticateReportKey = (req: Request | any, res: Response, next: NextFunction) => {
+  if (!REPORTS_API_KEY) {
+    return sendResponse(res, 503, { data: null, error: 'Disabled', message: 'Reports API is not enabled', status: 503 });
+  }
+  const provided = String(
+    (req.headers['x-api-key'] as string) || req.headers.authorization?.replace(/^Bearer\s+/i, '') || req.query.key || ''
+  );
+  const a = Buffer.from(provided);
+  const b = Buffer.from(REPORTS_API_KEY);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (!ok) return sendResponse(res, 401, { data: null, error: 'Unauthorized', message: 'Invalid API key', status: 401 });
+  next();
+};
 
 export const authenticateUser = (req: Request | any, res: Response, next: NextFunction) => {
   try {

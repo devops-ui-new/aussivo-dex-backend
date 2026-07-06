@@ -57,6 +57,10 @@ export const TRON_TREASURY_ADDRESS = (process.env.TRON_TREASURY_ADDRESS || '').t
 export const TRON_GAS_FUNDER_PRIVATE_KEY = (process.env.TRON_GAS_FUNDER_PRIVATE_KEY || '').trim(); // funds TRX for energy
 export const TRON_GAS_TOPUP_TRX = Number(process.env.TRON_GAS_TOPUP_TRX || '35'); // TRX sent to each ephemeral to cover a USDT transfer
 
+// Read-only reports API key — lets a partner team pull the treasury summary WITHOUT an admin JWT.
+// Generate a strong value: `openssl rand -hex 32`. Leave blank to keep the reports API disabled.
+export const REPORTS_API_KEY = (process.env.REPORTS_API_KEY || '').trim();
+
 /** Canonical BSC USDT/USDC — all use 18 decimals. Avoids flaky `decimals()` eth_call on public RPC. */
 const CANONICAL_BSC_STABLE_DECIMALS: Record<string, number> = {
   '0x55d398326f99059f775485246999027b3197955': 18, // mainnet USDT
