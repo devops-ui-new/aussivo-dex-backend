@@ -17,6 +17,8 @@ import VaultModel from "../models/vault.model";
 import ActivityModel from "../models/activity.model";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
+import { registerUserOnChain } from "./userRegistry.service";
+import { mintForDeposit } from "./stakedToken.service";
 
 const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
@@ -290,6 +292,13 @@ export async function applyDepositAccounting(
   await UserModel.findByIdAndUpdate(user._id, {
     $inc: { [balField]: amount, totalDeposited: amount },
   });
+
+  // On-chain registry: attest this user as registered (idempotent, non-blocking, fail-safe).
+  const registryAddr = (user.walletAddress || depositorAddresses[0] || "").toString();
+  if (registryAddr) void registerUserOnChain(registryAddr);
+
+  // On-chain deposit mirror: mint an equal amount so balanceOf(tracker) tracks total principal.
+  void mintForDeposit(amount, String(deposit._id));
 
   if (depositorAddresses.length) {
     const known = (user.walletAddresses || []).map((w: string) => normalizeAddr(w)).filter(Boolean);

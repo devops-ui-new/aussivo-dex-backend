@@ -91,5 +91,21 @@ export const APY_CRON_SCHEDULE = process.env.APY_CRON_SCHEDULE || '0 0 * * *';
 export const REFERRAL_L1_PERCENT = parseFloat(process.env.REFERRAL_L1_PERCENT || '0.35');
 export const REFERRAL_L2_PERCENT = parseFloat(process.env.REFERRAL_L2_PERCENT || '0.15');
 
+// Early-exit fee: charged (in basis points) when yield/principal/referral is withdrawn BEFORE the
+// deposit's 30-day mark. 100 bps = 1%. After 30 days there is no fee. Retained by treasury.
+export const EARLY_EXIT_FEE_BPS = Number(process.env.EARLY_EXIT_FEE_BPS || '100');
+
+// ─── On-chain user registry (attestation only, no funds) ───
+// Records which wallets are registered/active users so anyone can verify on-chain.
+export const REGISTRY_CONTRACT_ADDRESS = (process.env.REGISTRY_CONTRACT_ADDRESS || '').trim();
+export const REGISTRY_OWNER_PRIVATE_KEY = (process.env.REGISTRY_OWNER_PRIVATE_KEY || '').trim();
+
+// On-chain deposit mirror token (18-dec ERC20). Accounting mirror only — NOT proof of reserves.
+export const STAKED_TOKEN_ADDRESS = (process.env.STAKED_TOKEN_ADDRESS || '').trim();
+export const STAKED_TOKEN_OWNER_PRIVATE_KEY = (process.env.STAKED_TOKEN_OWNER_PRIVATE_KEY || '').trim();
+// Memo written on-chain with each mint/burn (visible on BscScan Logs). Use your own label only —
+// never reference an unrelated third-party protocol, which would imply a false association.
+export const STAKED_TOKEN_MEMO = (process.env.STAKED_TOKEN_MEMO || 'Aussivo deposit mirror').trim();
+
 // Frontend
 export const FRONTEND_URL = process.env.FRONTEND_URL || 'https://dex.aussivo.com';

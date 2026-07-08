@@ -23,6 +23,7 @@ import {
   EPHEMERAL_WALLET_SECRET,
   REFERRAL_L1_PERCENT,
   REFERRAL_L2_PERCENT,
+  EARLY_EXIT_FEE_BPS,
   TRON_TREASURY_ADDRESS,
   TRON_USDT_CONTRACT,
 } from "../configs/constants";
@@ -1001,14 +1002,25 @@ export default class UserController {
       const { amount, asset, source, walletAddress, depositId } = body;
       const user = await UserModel.findById(this.userId);
       if (!user)
-        return {
-          data: null,
-          error: "Not found",
-          message: "User not found",
-          status: 404,
-        };
+        return { data: null, error: "Not found", message: "User not found", status: 404 };
 
-      // ── DEPOSIT (principal) redemption ──
+      const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
+      const FEE_RATE = EARLY_EXIT_FEE_BPS / 10000; // 100 bps → 0.01
+      const round6 = (n: number) => Math.round(n * 1e6) / 1e6;
+      // Fee applies only before the 30-day mark (measured from `refDate`); free after.
+      const feeFor = (gross: number, refDate: any) => {
+        const early = Date.now() < new Date(refDate).getTime() + CYCLE_MS;
+        const fee = early ? round6(gross * FEE_RATE) : 0;
+        return { early, fee, netAmount: round6(gross - fee) };
+      };
+      // For balances not tied to one deposit (aggregate yield, referral), the 30-day clock
+      // starts at the user's earliest deposit (fallback: account creation).
+      const accountRefDate = async () => {
+        const earliest = await DepositModel.findOne({ userId: user._id }).sort({ createdAt: 1 }).select("createdAt");
+        return (earliest?.createdAt as any) || (user as any).createdAt || new Date();
+      };
+
+      // ── DEPOSIT (principal) redemption — withdrawable anytime; 1% fee if early ──
       if (source === "deposit") {
         if (!depositId)
           return { data: null, error: "Missing depositId", message: "depositId is required for deposit redemption", status: 400 };
@@ -1016,33 +1028,32 @@ export default class UserController {
         const deposit = await DepositModel.findById(depositId);
         if (!deposit || String(deposit.userId) !== String(user._id))
           return { data: null, error: "Not found", message: "Deposit not found", status: 404 };
-        // Active OR matured deposits can have their principal redeemed.
         if (deposit.status !== "active" && deposit.status !== "matured")
           return { data: null, error: "Invalid state", message: "Deposit is not redeemable", status: 400 };
-        if (deposit.lockUntil && new Date(deposit.lockUntil) > new Date())
-          return { data: null, error: "Locked", message: "Deposit is still locked", status: 400 };
 
         const existing = await WithdrawRequestModel.findOne({ depositId: deposit._id, status: "pending" });
         if (existing)
           return { data: null, error: "Duplicate", message: "Redemption already requested for this deposit", status: 400 };
 
+        const { early, fee, netAmount } = feeFor(deposit.amount, deposit.createdAt);
         const request = await WithdrawRequestModel.create({
           userId: user._id,
           amount: deposit.amount,
+          fee, netAmount, early,
           asset: deposit.asset,
           walletAddress,
           source: "deposit",
           depositId: deposit._id,
         });
 
-        return { data: request, error: null, message: "Redemption request submitted", status: 201 };
+        return {
+          data: request, error: null,
+          message: early ? `Redemption submitted — 1% early-exit fee applies (you receive ${netAmount} ${deposit.asset})` : "Redemption request submitted",
+          status: 201,
+        };
       }
 
-      // ── YIELD / REFERRAL off-chain withdrawals — DEDUCT ON APPROVAL ONLY ──
-      // Submitting NEVER changes any balance. Nothing is deducted until an admin approves
-      // the request (see admin.processWithdrawal). If it's rejected, everything stays exactly
-      // as it was. To prevent the same yield being requested twice, we block a second pending
-      // request for the same target.
+      // ── YIELD / REFERRAL — DEDUCT ON APPROVAL ONLY. Submitting never changes a balance. ──
       if (source === "yield") {
         const asset2 = asset === "USDC" ? "USDC" : "USDT";
 
@@ -1056,8 +1067,6 @@ export default class UserController {
           if (dup)
             return { data: null, error: "Duplicate", message: "A yield withdrawal for this deposit is already processing", status: 400 };
 
-          // Withdrawable = time-based earned − already-withdrawn. Pure read, no DB write.
-          const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
           const monthly = (deposit.amount * (deposit.apyPercent / 12)) / 100;
           const maxTotal = monthly * (deposit.maxYieldPayments || 0);
           const elapsed = Date.now() - new Date(deposit.createdAt as any).getTime();
@@ -1066,15 +1075,21 @@ export default class UserController {
           if (withdrawable < 1e-6)
             return { data: null, error: "Nothing to withdraw", message: "No yield earned to withdraw yet", status: 400 };
 
+          const { early, fee, netAmount } = feeFor(withdrawable, deposit.createdAt);
           const request = await WithdrawRequestModel.create({
             userId: user._id,
             amount: withdrawable,
+            fee, netAmount, early,
             asset: deposit.asset,
             walletAddress,
             source: "yield",
             depositId: deposit._id,
           });
-          return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
+          return {
+            data: request, error: null,
+            message: early ? `Yield withdrawal submitted — 1% early-exit fee applies (you receive ${netAmount} ${deposit.asset})` : "Withdrawal request submitted",
+            status: 201,
+          };
         }
 
         // ── AGGREGATE yield (top "Yield" card) ──
@@ -1087,14 +1102,20 @@ export default class UserController {
         if (bal < 1e-6)
           return { data: null, error: "Nothing to withdraw", message: "No yield to withdraw yet", status: 400 };
 
+        const { early, fee, netAmount } = feeFor(bal, await accountRefDate());
         const request = await WithdrawRequestModel.create({
           userId: user._id,
           amount: bal,
+          fee, netAmount, early,
           asset: asset2,
           walletAddress,
           source: "yield",
         });
-        return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
+        return {
+          data: request, error: null,
+          message: early ? `Yield withdrawal submitted — 1% early-exit fee applies (you receive ${netAmount} ${asset2})` : "Withdrawal request submitted",
+          status: 201,
+        };
       }
 
       if (source === "referral") {
@@ -1104,14 +1125,21 @@ export default class UserController {
         const bal = Number((user as any).referralEarnings || 0);
         if (amount <= 0 || amount > bal)
           return { data: null, error: "Insufficient", message: "Insufficient balance", status: 400 };
+
+        const { early, fee, netAmount } = feeFor(amount, await accountRefDate());
         const request = await WithdrawRequestModel.create({
           userId: user._id,
           amount,
+          fee, netAmount, early,
           asset,
           walletAddress,
           source: "referral",
         });
-        return { data: request, error: null, message: "Withdrawal request submitted", status: 201 };
+        return {
+          data: request, error: null,
+          message: early ? `Referral withdrawal submitted — 1% early-exit fee applies (you receive ${netAmount} ${asset})` : "Withdrawal request submitted",
+          status: 201,
+        };
       }
 
       return { data: null, error: "Invalid source", message: "Invalid withdrawal source", status: 400 };

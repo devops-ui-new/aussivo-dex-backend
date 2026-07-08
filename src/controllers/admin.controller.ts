@@ -15,6 +15,8 @@ import { distributeMonthlyAPY } from '../helpers/apyDistribution.helper';
 import { isVaultPayoutConfigured, payoutUserOnChain } from '../services/vaultPayout.service';
 import { getGasFunderStatus, forceSweepPending as forceSweepBep } from '../services/ephemeralDepositSweep.service';
 import { getTronGasFunderStatus, forceSweepPending as forceSweepTron } from '../services/tronDepositSweep.service';
+import { deregisterUserOnChain } from '../services/userRegistry.service';
+import { burnForWithdrawal } from '../services/stakedToken.service';
 import logger from '../configs/logger.config';
 
 export default class AdminController {
@@ -46,7 +48,7 @@ export default class AdminController {
   // ── DASHBOARD ──
   async getDashboard(): Promise<IResponse> {
     try {
-      const [totalUsers, totalDeposits, activeVaults, totalTVL, pendingWithdrawals, totalYieldDistributed, recentDeposits] = await Promise.all([
+      const [totalUsers, totalDeposits, activeVaults, totalTVL, pendingWithdrawals, totalYieldDistributed, recentDeposits, feesAgg] = await Promise.all([
         UserModel.countDocuments({ status: 'active' }),
         DepositModel.countDocuments(),
         VaultModel.countDocuments({ status: 'active' }),
@@ -54,6 +56,7 @@ export default class AdminController {
         WithdrawRequestModel.countDocuments({ status: 'pending' }),
         YieldLogModel.aggregate([{ $match: { source: 'vault_apy' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
         DepositModel.find().populate('userId', 'name email').populate('vaultId', 'name').sort({ createdAt: -1 }).limit(10),
+        WithdrawRequestModel.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: null, total: { $sum: '$fee' } } }]),
       ]);
 
       return {
@@ -62,6 +65,7 @@ export default class AdminController {
           totalTVL: totalTVL[0]?.total || 0,
           pendingWithdrawals,
           totalYieldDistributed: totalYieldDistributed[0]?.total || 0,
+          earlyExitFeesCollected: Math.round(((feesAgg[0]?.total) || 0) * 1e6) / 1e6,
           recentDeposits,
         },
         error: null, message: 'Dashboard data', status: 200
@@ -317,6 +321,8 @@ export default class AdminController {
         if (!claimed) return { data: null, error: 'Conflict', message: 'Request already being processed', status: 409 };
 
         let finalTxHash = (txHash || '').trim();
+        // Pay the NET amount (gross − early-exit fee). The fee stays in the treasury.
+        const netPayout = (request as any).netAmount && (request as any).netAmount > 0 ? (request as any).netAmount : request.amount;
 
         // If no manual hash supplied and the vault signer is configured, auto-pay on-chain.
         if (!finalTxHash && isVaultPayoutConfigured()) {
@@ -324,7 +330,7 @@ export default class AdminController {
             const result = await payoutUserOnChain({
               asset: request.asset as 'USDT' | 'USDC',
               userAddress: request.walletAddress,
-              amount: request.amount,
+              amount: netPayout,
               reason: `wdreq:${requestId}`,
             });
             finalTxHash = result.txHash;
@@ -351,6 +357,16 @@ export default class AdminController {
           if (deposit && deposit.status !== 'withdrawn') {
             await DepositModel.findByIdAndUpdate(request.depositId, { status: 'withdrawn', withdrawnAt: new Date() });
             await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: -deposit.amount, totalUsers: -1 } });
+
+            // On-chain deposit mirror: burn the principal so the mirror reflects CURRENT total.
+            void burnForWithdrawal(deposit.amount, String(deposit._id));
+
+            // On-chain registry: if the user now has NO active/matured deposits, deregister them.
+            const remaining = await DepositModel.countDocuments({ userId: uid, status: { $in: ['active', 'matured'] } });
+            if (remaining === 0) {
+              const u: any = await UserModel.findById(uid).select('walletAddress');
+              if (u?.walletAddress) void deregisterUserOnChain(u.walletAddress);
+            }
           }
         } else if (request.source === 'yield' && request.depositId) {
           // Per-deposit yield: now mark it withdrawn against that deposit.
@@ -363,8 +379,8 @@ export default class AdminController {
           await UserModel.findByIdAndUpdate(uid, { $inc: { referralEarnings: -request.amount } });
         }
 
-        await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Approved', type: 'admin', metadata: { requestId, amount: request.amount, txHash: finalTxHash } });
-        return { data: { txHash: finalTxHash }, error: null, message: 'Withdrawal approved', status: 200 };
+        await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Approved', type: 'admin', metadata: { requestId, amount: request.amount, fee: (request as any).fee || 0, netPaid: netPayout, txHash: finalTxHash } });
+        return { data: { txHash: finalTxHash, netPaid: netPayout, fee: (request as any).fee || 0 }, error: null, message: 'Withdrawal approved', status: 200 };
       } else {
         // REJECT: nothing was ever deducted at submit time, so there is nothing to refund —
         // every balance stays exactly as it was. Just mark the request rejected.
