@@ -3,23 +3,13 @@ import { Schema, model, Types } from "mongoose";
 const PendingDepositSchema = new Schema(
   {
     userId: { type: Types.ObjectId, ref: "users", required: true, index: true },
-    vaultId: {
-      type: Types.ObjectId,
-      ref: "vaults",
-      required: true,
-      index: true,
-    },
+    vaultId: { type: Types.ObjectId, ref: "vaults", required: true, index: true },
     expectedAmount: { type: Number, required: true },
     expectedAmountBaseUnits: { type: String, required: true, index: true },
     requestId: { type: String, required: true, index: true },
     asset: { type: String, enum: ["USDT", "USDC"], required: true },
     /** Which chain the deposit address is on. bep20 = BSC/EVM, trc20 = Tron. */
-    network: {
-      type: String,
-      enum: ["bep20", "trc20"],
-      default: "bep20",
-      index: true,
-    },
+    network: { type: String, enum: ["bep20", "trc20"], default: "bep20", index: true },
     /** Legacy: user wallet hint for old vault-contract flow. Optional for ephemeral deposits. */
     walletAddress: { type: String, default: "", lowercase: true, index: true },
     /** One-time deposit address (QR); funds swept to treasury after detection.
@@ -35,6 +25,8 @@ const PendingDepositSchema = new Schema(
     privateKeyHash: { type: String, default: "", index: true },
     gasFundTxHash: { type: String, default: "" },
     energyFundedAt: { type: Date }, // last time TRX energy was sent to a Tron ephemeral (fund cooldown)
+    energyFundAttempts: { type: Number, default: 0 }, // how many times we've topped up energy (cap to avoid draining funder)
+    fundingHalted: { type: Boolean, default: false }, // stop funding after too many failed attempts (needs manual review)
     /**
      * pending = waiting for USDT; credited = user portfolio updated, sweep may be pending;
      * matched = sweep done + key material purged; expired = timed out with no payment.
@@ -64,7 +56,7 @@ const PendingDepositSchema = new Schema(
     /** When decryptable private key material was removed from this document. */
     keyPurgedAt: { type: Date, default: null },
   },
-  { timestamps: true, versionKey: false },
+  { timestamps: true, versionKey: false }
 );
 
 PendingDepositSchema.index({ ephemeralAddress: 1, asset: 1, status: 1 });

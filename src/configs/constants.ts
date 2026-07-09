@@ -55,7 +55,11 @@ export const TRON_USDT_CONTRACT = process.env.TRON_USDT_CONTRACT || 'TR7NHqjeKQx
 export const TRON_USDT_DECIMALS = 6; // TRC20 USDT uses 6 decimals (BEP20 uses 18)
 export const TRON_TREASURY_ADDRESS = (process.env.TRON_TREASURY_ADDRESS || '').trim(); // where TRC20 deposits are swept
 export const TRON_GAS_FUNDER_PRIVATE_KEY = (process.env.TRON_GAS_FUNDER_PRIVATE_KEY || '').trim(); // funds TRX for energy
-export const TRON_GAS_TOPUP_TRX = Number(process.env.TRON_GAS_TOPUP_TRX || '35'); // TRX sent to each ephemeral to cover a USDT transfer
+export const TRON_GAS_TOPUP_TRX = Number(process.env.TRON_GAS_TOPUP_TRX || '20'); // TRX sent to each ephemeral to cover a USDT transfer (sweep to treasury needs ~14)
+// Stop re-funding a deposit that never sweeps after this many attempts (prevents draining the funder).
+export const TRON_MAX_FUND_ATTEMPTS = Number(process.env.TRON_MAX_FUND_ATTEMPTS || '3');
+// After a successful sweep, send the ephemeral's leftover TRX back to the funder (recovers stranded TRX).
+export const TRON_RECLAIM_LEFTOVER = (process.env.TRON_RECLAIM_LEFTOVER || 'true') === 'true';
 
 // Read-only reports API key — lets a partner team pull the treasury summary WITHOUT an admin JWT.
 // Generate a strong value: `openssl rand -hex 32`. Leave blank to keep the reports API disabled.

@@ -27,6 +27,8 @@ import {
   TRON_TREASURY_ADDRESS,
   TRON_GAS_FUNDER_PRIVATE_KEY,
   TRON_GAS_TOPUP_TRX,
+  TRON_MAX_FUND_ATTEMPTS,
+  TRON_RECLAIM_LEFTOVER,
   EPHEMERAL_WALLET_SECRET,
 } from "../configs/constants";
 
@@ -100,6 +102,29 @@ async function sweepToTreasury(ephemeralAddress: string, privateKey: string, amo
   return txid;
 }
 
+/**
+ * After a successful sweep, send the ephemeral's leftover TRX back to the gas funder so it isn't
+ * stranded. Keeps a small reserve for the transfer's own fee, and skips dust. Fail-safe: any error
+ * here is logged and ignored (the USDT is already safe in treasury).
+ */
+async function reclaimLeftoverTrx(address: string, privateKey: string): Promise<void> {
+  if (!TRON_RECLAIM_LEFTOVER || !TRON_GAS_FUNDER_PRIVATE_KEY) return;
+  try {
+    const eph = makeTronWeb(privateKey);
+    const funderAddr = makeTronWeb(TRON_GAS_FUNDER_PRIVATE_KEY).address.fromPrivateKey(TRON_GAS_FUNDER_PRIVATE_KEY) as string;
+    const balSun = Number(await eph.trx.getBalance(address));
+    const RESERVE_SUN = 1_500_000;          // ~1.5 TRX left behind for this transfer's own fee
+    const MIN_RECLAIM_SUN = 2_000_000;      // don't bother reclaiming < 2 TRX of dust
+    const sendSun = balSun - RESERVE_SUN;
+    if (sendSun < MIN_RECLAIM_SUN) return;
+    const tx = await eph.trx.sendTransaction(funderAddr, sendSun);
+    const txid = (tx as any)?.txid || (tx as any)?.transaction?.txID || "";
+    logger.info(`[TronSweep] reclaimed ${(sendSun / 1e6).toFixed(2)} TRX ${address} → funder tx=${txid}`);
+  } catch (e: any) {
+    logger.warn(`[TronSweep] reclaim leftover failed ${address}: ${e?.message || e}`);
+  }
+}
+
 async function processOne(doc: any): Promise<void> {
   const tron = makeTronWeb();
   const address: string = doc.ephemeralAddress;
@@ -136,12 +161,25 @@ async function processOne(doc: any): Promise<void> {
   try { trxBalSun = Number(await tron.trx.getBalance(address)); } catch { /* fall through */ }
   const needSun = Number(tron.toSun(TRON_GAS_TOPUP_TRX)) * 0.6;
   if (trxBalSun < needSun) {
+    // Give up funding a deposit that never sweeps — this is what drained the funder (same address
+    // funded 3–4×). After the cap it's left for manual review (shows in Sweep Health as stuck).
+    if (doc.fundingHalted) {
+      logger.warn(`[TronSweep] ${address}: funding halted (${doc.energyFundAttempts} attempts) — needs manual review / force-sweep`);
+      return;
+    }
     const FUND_COOLDOWN_MS = 3 * 60 * 1000;
     const lastFund = doc.energyFundedAt ? new Date(doc.energyFundedAt).getTime() : 0;
     if (Date.now() - lastFund > FUND_COOLDOWN_MS) {
+      const attempts = (Number(doc.energyFundAttempts) || 0) + 1;
+      if (attempts > TRON_MAX_FUND_ATTEMPTS) {
+        await PendingDepositModel.findByIdAndUpdate(doc._id, { fundingHalted: true });
+        logger.warn(`[TronSweep] ${address}: ${TRON_MAX_FUND_ATTEMPTS} fund attempts without a sweep — halting further funding to protect the gas funder`);
+        return;
+      }
       const tx = await fundTronEnergy(address);
       await PendingDepositModel.findByIdAndUpdate(doc._id, {
         energyFundedAt: new Date(),
+        energyFundAttempts: attempts,
         ...(tx ? { gasFundTxHash: tx } : {}),
       });
     } else {
@@ -158,6 +196,8 @@ async function processOne(doc: any): Promise<void> {
         privateKeyEncrypted: "", keyPurgedAt: new Date(),
         privateKeyHash: doc.privateKeyHash || hashPrivateKeyHexFingerprint(pk),
       });
+      // Recover the ephemeral's leftover TRX back to the funder (non-blocking, fail-safe).
+      await reclaimLeftoverTrx(address, pk);
     }
   } catch (e: any) {
     logger.warn(`[TronSweep] sweep failed ${address} (will retry): ${e?.message || e}`);
@@ -197,8 +237,11 @@ export function stopTronDepositSweep(): void {
 
 /** Admin action: immediately re-fund energy and re-run the sweep for one pending deposit (Tron). */
 export async function forceSweepPending(id: string): Promise<void> {
-  // Clear the fund cooldown so a manual retry can top up energy right away.
-  await PendingDepositModel.findByIdAndUpdate(id, { $unset: { energyFundedAt: 1 } });
+  // Clear the fund cooldown AND the halt/attempt cap so a manual retry can top up energy right away.
+  await PendingDepositModel.findByIdAndUpdate(id, {
+    $unset: { energyFundedAt: 1 },
+    $set: { fundingHalted: false, energyFundAttempts: 0 },
+  });
   const doc = await PendingDepositModel.findById(id);
   if (doc) await processOne(doc);
 }
