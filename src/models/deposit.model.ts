@@ -17,6 +17,18 @@ const DepositSchema = new Schema({
   totalYieldPaid: { type: Number, default: 0 },
   /** How much of THIS deposit's credited yield has already been withdrawn. */
   yieldWithdrawn: { type: Number, default: 0 },
+  /**
+   * 30-day maturation model:
+   *  - cyclesMatured: whole 30-day cycles whose yield has already matured (credited to the
+   *    user's withdrawable yield wallet). Advances one per completed 30-day cycle, capped at
+   *    maxYieldPayments. Live (un-matured) yield for the CURRENT cycle is computed on the fly
+   *    and is NOT withdrawable until its cycle completes.
+   *  - maturedYield: cumulative yield this deposit has matured (moved into the withdrawable bucket).
+   *  - maturedYieldWithdrawn: portion of maturedYield the user has since withdrawn (audit only).
+   */
+  cyclesMatured: { type: Number, default: 0 },
+  maturedYield: { type: Number, default: 0 },
+  maturedYieldWithdrawn: { type: Number, default: 0 },
   yieldPaymentsCount: { type: Number, default: 0 },
   maxYieldPayments: { type: Number, required: true },  // = vault durationMonths
   status: { type: String, enum: ['active', 'withdrawn', 'matured'], default: 'active' },

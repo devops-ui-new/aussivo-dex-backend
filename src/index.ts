@@ -22,6 +22,12 @@ connectDB(async (mongooseConn) => {
 
   const app = express();
 
+  // Behind Railway's proxy/load-balancer. Without this, req.ip is the proxy's IP
+  // (the same for every visitor), so the per-IP rate limiter throttles all users
+  // together and auth calls (send-otp / verify-otp / wallet-auth / me) fail intermittently.
+  // Trusting the first proxy hop makes req.ip the real client (via X-Forwarded-For).
+  app.set('trust proxy', 1);
+
   // ── Middleware ──
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true }));

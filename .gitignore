@@ -45,3 +45,5 @@ Thumbs.db
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
+
+*.zip

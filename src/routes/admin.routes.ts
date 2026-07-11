@@ -13,6 +13,10 @@ router.post('/login', async (req: Request, res: Response) => {
 router.get('/dashboard', authenticateAdmin, async (req: Request, res: Response) => {
   const r = await new AdminController(req, res).getDashboard(); return sendResponse(res, r.status, r);
 });
+// Financial overview — yield generated/matured/withdrawn, live accruing, principal movement
+router.get('/financial-overview', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).getFinancialOverview(); return sendResponse(res, r.status, r);
+});
 
 // Vaults
 router.get('/vaults', authenticateAdmin, async (req: Request, res: Response) => {

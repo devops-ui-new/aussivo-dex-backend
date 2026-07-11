@@ -46,40 +46,43 @@ export const distributeMonthlyAPY = async () => {
 };
 
 /**
- * Continuous yield accrual — the single source of truth for crediting yield.
+ * 30-DAY MATURATION — the single source of truth for crediting yield.
  *
- * Yield accrues every second (not in 30-day jumps). The amount EARNED by `now` is
- *   entitled = min( monthlyYield * elapsed/30days , monthlyYield * maxYieldPayments )
- * and `totalYieldPaid` is the running total already credited. We credit the difference.
+ * Yield now matures in whole 30-day cycles instead of accruing continuously. Each time a
+ * deposit crosses a 30-day boundary, that cycle's monthly yield "matures": it's credited to
+ * the user's withdrawable yield wallet (yieldWalletUSDT/USDC) and the deposit's live counter
+ * resets to 0 for the next cycle. Un-matured yield inside the current (incomplete) cycle is
+ * NOT withdrawable and is forfeited if the principal is withdrawn before that cycle completes.
  *
- * This is drift-free and idempotent: re-running it credits nothing extra, because it
- * compares absolute elapsed time to what's already been paid. It's called BOTH by the
- * daily cron (to keep wallets fresh for display) AND on-demand when a user withdraws
- * yield — which is what makes yield withdrawable anytime.
+ * This function is idempotent: it credits ONLY newly-completed cycles (tracked by
+ * `cyclesMatured`), so it can be called safely from the daily cron, on portfolio load, and
+ * right before a withdrawal without ever double-crediting. Because a maturation is a real,
+ * discrete monthly event, it always writes a YieldLog + referral commissions when it fires.
  *
- * Returns the amount newly credited (0 if nothing was due).
+ * Returns the amount newly matured (0 if no new cycle completed).
  */
-export const settleDepositYield = async (deposit: any, opts: { log?: boolean } = {}): Promise<number> => {
-  const log = opts.log !== false; // default true (cron). Pass {log:false} for on-demand settles.
+export const settleDepositYield = async (deposit: any, _opts: { log?: boolean } = {}): Promise<number> => {
   const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
   const monthlyYield = (deposit.amount * (deposit.apyPercent / 12)) / 100; // apyPercent is ANNUAL
-  if (monthlyYield <= 0) return 0;
+  const maxCycles = Number(deposit.maxYieldPayments || 0);
+  if (monthlyYield <= 0 || maxCycles <= 0) return 0;
 
-  const maxTotal = monthlyYield * (deposit.maxYieldPayments || 0);
   const createdMs = new Date(deposit.createdAt as any).getTime();
   const elapsedMs = Date.now() - createdMs;
 
-  const entitled = Math.min(monthlyYield * (elapsedMs / CYCLE_MS), maxTotal);
-  const alreadyPaid = deposit.totalYieldPaid || 0;
-  const unpaid = entitled - alreadyPaid;
+  // Whole 30-day cycles that have fully elapsed, capped at the deposit's term.
+  const completedCycles = Math.min(Math.floor(elapsedMs / CYCLE_MS), maxCycles);
+  // Backward-compat: deposits created under the previous (continuous) model already had yield
+  // credited (tracked in totalYieldPaid) but have cyclesMatured = 0. Treat the equivalent number
+  // of already-paid cycles as matured so migration never re-credits them (idempotent on old data).
+  const paidCycles = Math.floor((Number(deposit.totalYieldPaid || 0) / monthlyYield) + 1e-9);
+  const alreadyMatured = Math.max(Number(deposit.cyclesMatured || 0), paidCycles);
+  const newCycles = completedCycles - alreadyMatured;
 
-  // A deposit ONLY matures when its full term of time has actually elapsed — never
-  // because a (possibly stale) dollar total reached the cap. This is critical: it
-  // prevents a deposit from being wrongly closed while the principal is still locked.
-  const termComplete = deposit.maxYieldPayments > 0 && elapsedMs >= deposit.maxYieldPayments * CYCLE_MS;
+  // Term is complete once every cycle has matured — principal stays redeemable, just no more yield.
+  const termComplete = completedCycles >= maxCycles;
 
-  // Nothing meaningful to credit (ignore sub-dust so we don't create $0.0000 log rows).
-  if (unpaid < 1e-6) {
+  if (newCycles <= 0) {
     if (termComplete && deposit.status === 'active') {
       await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
     }
@@ -89,67 +92,86 @@ export const settleDepositYield = async (deposit: any, opts: { log?: boolean } =
   const user = await UserModel.findById(deposit.userId);
   if (!user || user.status !== 'active') return 0;
 
+  const matureAmount = newCycles * monthlyYield;
   const yieldField = deposit.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
 
-  await UserModel.findByIdAndUpdate(user._id, { $inc: { [yieldField]: unpaid } });
+  // Credit the matured yield into the user's WITHDRAWABLE bucket.
+  await UserModel.findByIdAndUpdate(user._id, { $inc: { [yieldField]: matureAmount } });
 
   await DepositModel.findByIdAndUpdate(deposit._id, {
-    $inc: { totalYieldPaid: unpaid, yieldPaymentsCount: 1 },
+    $inc: {
+      totalYieldPaid: matureAmount,
+      maturedYield: matureAmount,
+      yieldPaymentsCount: newCycles,
+    },
+    cyclesMatured: completedCycles,
     ...(termComplete ? { status: 'matured' } : {}),
   });
 
-  // Logs / activity / referral are the "official accounting" — only created by the daily
-  // cron, NOT by the silent on-demand settle that runs when a user withdraws. That keeps
-  // "Recent Yield Payments" free of a new row for every withdraw click.
-  if (log) {
-    await YieldLogModel.create({
-      userId: user._id,
-      depositId: deposit._id,
-      vaultId: deposit.vaultId,
-      amount: unpaid,
-      asset: deposit.asset,
-      apyPercent: deposit.apyPercent,
-      depositAmount: deposit.amount,
-      paymentNumber: (deposit.yieldPaymentsCount || 0) + 1,
-      source: 'vault_apy',
-    });
-    await ActivityModel.create({
-      userId: user._id,
-      title: 'APY Yield Credited',
-      description: `$${unpaid.toFixed(6)} ${deposit.asset} yield accrued`,
-      type: 'yield',
-      metadata: { vaultId: deposit.vaultId, depositId: deposit._id, amount: unpaid },
-    });
-    // Referral commissions on the newly accrued yield (L1 0.35%, L2 0.15% of yield).
-    await distributeReferralCommissions(user._id, unpaid, deposit.asset, deposit._id, deposit.vaultId);
-  }
+  // A matured cycle is official accounting: always logged, and always pays referral commissions.
+  await YieldLogModel.create({
+    userId: user._id,
+    depositId: deposit._id,
+    vaultId: deposit.vaultId,
+    amount: matureAmount,
+    asset: deposit.asset,
+    apyPercent: deposit.apyPercent,
+    depositAmount: deposit.amount,
+    paymentNumber: completedCycles,
+    source: 'vault_apy',
+  });
+  await ActivityModel.create({
+    userId: user._id,
+    title: 'Yield Matured',
+    description: `$${matureAmount.toFixed(6)} ${deposit.asset} matured (${newCycles} × 30-day cycle) and is now withdrawable`,
+    type: 'yield',
+    metadata: { vaultId: deposit.vaultId, depositId: deposit._id, amount: matureAmount, cycles: newCycles },
+  });
+  await distributeReferralCommissions(user._id, matureAmount, deposit.asset, deposit._id, deposit.vaultId);
 
-  return unpaid;
+  return matureAmount;
 };
 
 /**
- * Settle ONE deposit's accrued yield (silently, no log) and return how much of THIS
- * deposit's yield is withdrawable right now: credited minus already-withdrawn, capped
- * at the user's actual wallet balance for the asset (the binding safety constraint).
+ * Live (un-matured) yield for the CURRENT, incomplete 30-day cycle of one deposit.
+ * This is the number the portfolio shows as "accruing this cycle" — it climbs from 0 to one
+ * monthly-yield over 30 days, then resets to 0 when the cycle matures. It is NOT withdrawable.
+ */
+export const computeLiveCycleYield = (deposit: any): number => {
+  const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
+  const monthlyYield = (deposit.amount * (deposit.apyPercent / 12)) / 100;
+  const maxCycles = Number(deposit.maxYieldPayments || 0);
+  if (monthlyYield <= 0 || maxCycles <= 0) return 0;
+  const elapsedMs = Date.now() - new Date(deposit.createdAt as any).getTime();
+  const completedCycles = Math.min(Math.floor(elapsedMs / CYCLE_MS), maxCycles);
+  if (completedCycles >= maxCycles) return 0; // term done, nothing accruing
+  const fracMs = elapsedMs - completedCycles * CYCLE_MS;
+  return Math.max(0, monthlyYield * (fracMs / CYCLE_MS));
+};
+
+/**
+ * Mature ONE deposit's completed cycles (idempotent) and return how much of THIS deposit's
+ * matured yield is still withdrawable: matured minus already-withdrawn, capped at the user's
+ * actual wallet balance for the asset (the binding safety constraint).
  */
 export const getWithdrawableDepositYield = async (
   deposit: any
 ): Promise<number> => {
-  await settleDepositYield(deposit, { log: false });
+  await settleDepositYield(deposit);
   const fresh = await DepositModel.findById(deposit._id);
   if (!fresh) return 0;
   const user = await UserModel.findById(fresh.userId);
   if (!user) return 0;
   const field = fresh.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
   const walletBal = Number((user as any)[field] || 0);
-  const ownYield = Number(fresh.totalYieldPaid || 0) - Number((fresh as any).yieldWithdrawn || 0);
-  return Math.max(0, Math.min(ownYield, walletBal));
+  const ownMatured = Number((fresh as any).maturedYield || 0) - Number((fresh as any).maturedYieldWithdrawn || 0);
+  return Math.max(0, Math.min(ownMatured, walletBal));
 };
 
 /**
- * Settle (credit) all of a user's currently-accrued yield for one asset, then return the
- * user's resulting withdrawable yield-wallet balance for that asset. Called right before a
- * yield withdrawal so the user can take out everything they've earned, at any moment.
+ * Mature (credit) all of a user's newly-completed cycles for one asset, then return the user's
+ * resulting withdrawable yield-wallet balance for that asset. Called right before a yield
+ * withdrawal so the user can take out everything that has matured to date.
  */
 export const settleUserYieldForAsset = async (
   userId: string,
@@ -157,7 +179,7 @@ export const settleUserYieldForAsset = async (
 ): Promise<number> => {
   const deposits = await DepositModel.find({ userId, asset, status: 'active' });
   for (const d of deposits) {
-    try { await settleDepositYield(d, { log: false }); } catch (e: any) {
+    try { await settleDepositYield(d); } catch (e: any) {
       logger.error(`[YieldSettle] deposit ${d._id}: ${e.message}`);
     }
   }

@@ -28,7 +28,7 @@ import {
   TRON_USDT_CONTRACT,
 } from "../configs/constants";
 import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/walletCrypto.helper";
-import { settleUserYieldForAsset, getWithdrawableDepositYield } from "../helpers/apyDistribution.helper";
+import { settleUserYieldForAsset, settleDepositYield, computeLiveCycleYield } from "../helpers/apyDistribution.helper";
 import { fundEphemeralGas } from "../services/ephemeralDepositSweep.service";
 import { createTronEphemeral, fundTronEnergy } from "../services/tronDepositSweep.service";
 import { IResponse } from "../utils/response.util";
@@ -844,6 +844,13 @@ export default class UserController {
   // ── USER DEPOSITS ──
   async getDeposits(page = 1, limit = 10): Promise<IResponse> {
     try {
+      // Mature any completed 30-day cycles for this user before returning, so the withdrawable
+      // yield wallet is always current and the live "accruing this cycle" figure resets on time.
+      try {
+        const active = await DepositModel.find({ userId: this.userId, status: "active" });
+        for (const d of active) { try { await settleDepositYield(d); } catch { /* non-blocking */ } }
+      } catch { /* non-blocking */ }
+
       const skip = (page - 1) * limit;
       const [deposits, total, pendingRedemptions] = await Promise.all([
         DepositModel.find({ userId: this.userId })
@@ -1020,7 +1027,10 @@ export default class UserController {
         return (earliest?.createdAt as any) || (user as any).createdAt || new Date();
       };
 
-      // ── DEPOSIT (principal) redemption — withdrawable anytime; 1% fee if early ──
+      // ── DEPOSIT (principal) redemption — withdrawable ANYTIME ──
+      // Before 30 days: 1% early-exit fee AND the current (un-matured) cycle's yield is
+      // forfeited (it never matured, so it's simply never credited). Matured yield from
+      // completed cycles already sits in the user's yield wallet and is kept.
       if (source === "deposit") {
         if (!depositId)
           return { data: null, error: "Missing depositId", message: "depositId is required for deposit redemption", status: 400 };
@@ -1035,6 +1045,11 @@ export default class UserController {
         if (existing)
           return { data: null, error: "Duplicate", message: "Redemption already requested for this deposit", status: 400 };
 
+        // Credit any completed-but-not-yet-matured cycle first, so the user keeps every FULL
+        // cycle they've earned. The current partial cycle stays un-matured and is forfeited.
+        try { await settleDepositYield(deposit); } catch { /* non-blocking */ }
+        const forfeitedLiveYield = round6(computeLiveCycleYield(deposit));
+
         const { early, fee, netAmount } = feeFor(deposit.amount, deposit.createdAt);
         const request = await WithdrawRequestModel.create({
           userId: user._id,
@@ -1047,73 +1062,40 @@ export default class UserController {
         });
 
         return {
-          data: request, error: null,
-          message: early ? `Redemption submitted — 1% early-exit fee applies (you receive ${netAmount} ${deposit.asset})` : "Redemption request submitted",
+          data: { ...request.toObject(), forfeitedLiveYield }, error: null,
+          message: early
+            ? `Redemption submitted — 1% early-exit fee applies and this cycle's un-matured yield (~$${forfeitedLiveYield.toFixed(4)}) is forfeited. You receive ${netAmount} ${deposit.asset}.`
+            : "Redemption request submitted",
           status: 201,
         };
       }
 
-      // ── YIELD / REFERRAL — DEDUCT ON APPROVAL ONLY. Submitting never changes a balance. ──
+      // ── YIELD — only MATURED yield is withdrawable (post 30-day cycles). No fee. ──
+      // Live (un-matured) yield inside the current cycle is never withdrawable here; it only
+      // becomes available once its 30-day cycle completes and matures into the yield wallet.
       if (source === "yield") {
         const asset2 = asset === "USDC" ? "USDC" : "USDT";
 
-        if (depositId) {
-          // ── PER-DEPOSIT yield ──
-          const deposit = await DepositModel.findById(depositId);
-          if (!deposit || String(deposit.userId) !== String(user._id))
-            return { data: null, error: "Not found", message: "Deposit not found", status: 404 };
-
-          const dup = await WithdrawRequestModel.findOne({ depositId: deposit._id, source: "yield", status: "pending" });
-          if (dup)
-            return { data: null, error: "Duplicate", message: "A yield withdrawal for this deposit is already processing", status: 400 };
-
-          const monthly = (deposit.amount * (deposit.apyPercent / 12)) / 100;
-          const maxTotal = monthly * (deposit.maxYieldPayments || 0);
-          const elapsed = Date.now() - new Date(deposit.createdAt as any).getTime();
-          const entitled = Math.min(monthly * (elapsed / CYCLE_MS), maxTotal);
-          const withdrawable = entitled - (Number((deposit as any).yieldWithdrawn) || 0);
-          if (withdrawable < 1e-6)
-            return { data: null, error: "Nothing to withdraw", message: "No yield earned to withdraw yet", status: 400 };
-
-          const { early, fee, netAmount } = feeFor(withdrawable, deposit.createdAt);
-          const request = await WithdrawRequestModel.create({
-            userId: user._id,
-            amount: withdrawable,
-            fee, netAmount, early,
-            asset: deposit.asset,
-            walletAddress,
-            source: "yield",
-            depositId: deposit._id,
-          });
-          return {
-            data: request, error: null,
-            message: early ? `Yield withdrawal submitted — 1% early-exit fee applies (you receive ${netAmount} ${deposit.asset})` : "Withdrawal request submitted",
-            status: 201,
-          };
-        }
-
-        // ── AGGREGATE yield (top "Yield" card) ──
-        const dupAgg = await WithdrawRequestModel.findOne({ userId: user._id, source: "yield", asset: asset2, depositId: null, status: "pending" });
+        const dupAgg = await WithdrawRequestModel.findOne({ userId: user._id, source: "yield", asset: asset2, status: "pending" });
         if (dupAgg)
           return { data: null, error: "Duplicate", message: "A yield withdrawal is already processing", status: 400 };
 
-        const walletField = asset2 === "USDT" ? "yieldWalletUSDT" : "yieldWalletUSDC";
-        const bal = Number((user as any)[walletField] || 0);
+        // Mature any newly-completed cycles, then withdraw the whole matured balance.
+        const bal = round6(await settleUserYieldForAsset(String(user._id), asset2));
         if (bal < 1e-6)
-          return { data: null, error: "Nothing to withdraw", message: "No yield to withdraw yet", status: 400 };
+          return { data: null, error: "Nothing to withdraw", message: "No matured yield to withdraw yet — yield becomes withdrawable after each 30-day cycle completes.", status: 400 };
 
-        const { early, fee, netAmount } = feeFor(bal, await accountRefDate());
         const request = await WithdrawRequestModel.create({
           userId: user._id,
           amount: bal,
-          fee, netAmount, early,
+          fee: 0, netAmount: bal, early: false,
           asset: asset2,
           walletAddress,
           source: "yield",
         });
         return {
           data: request, error: null,
-          message: early ? `Yield withdrawal submitted — 1% early-exit fee applies (you receive ${netAmount} ${asset2})` : "Withdrawal request submitted",
+          message: "Matured yield withdrawal submitted",
           status: 201,
         };
       }

@@ -11,7 +11,7 @@ import PendingDepositModel from '../models/pendingDeposit.model';
 import ActivityModel from '../models/activity.model';
 import { JWT_SECRET } from '../configs/constants';
 import { IResponse } from '../utils/response.util';
-import { distributeMonthlyAPY } from '../helpers/apyDistribution.helper';
+import { distributeMonthlyAPY, computeLiveCycleYield } from '../helpers/apyDistribution.helper';
 import { isVaultPayoutConfigured, payoutUserOnChain } from '../services/vaultPayout.service';
 import { getGasFunderStatus, forceSweepPending as forceSweepBep } from '../services/ephemeralDepositSweep.service';
 import { getTronGasFunderStatus, forceSweepPending as forceSweepTron } from '../services/tronDepositSweep.service';
@@ -447,6 +447,91 @@ export default class AdminController {
       ]);
 
       return { data: { topReferrers, totalReferralPaid }, error: null, message: 'Referral stats', status: 200 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // ── FINANCIAL OVERVIEW ──
+  // A single, reconcilable view of every money flow: yield generated → matured (withdrawable)
+  // → withdrawn, plus live (un-matured) yield still accruing, and full principal movement.
+  async getFinancialOverview(): Promise<IResponse> {
+    try {
+      const r6 = (n: any) => Math.round(Number(n || 0) * 1e6) / 1e6;
+      const sum = (arr: any[]) => (arr?.[0]?.total || 0);
+
+      const [
+        yieldGenerated,            // all matured yield ever recognised (YieldLog vault_apy)
+        referralGenerated,         // all referral commissions ever paid out (YieldLog referral_*)
+        walletBalances,            // matured yield sitting in user wallets (withdrawable, not yet withdrawn)
+        referralOutstanding,       // referral earnings not yet withdrawn
+        yieldWithdrawnAgg,         // completed yield withdrawals (gross + net paid + fees)
+        referralWithdrawnAgg,      // completed referral withdrawals
+        principalRedeemedAgg,      // completed principal redemptions (gross + net + fees + early count)
+        pendingByType,             // pending withdrawals grouped by source
+        activePrincipalAgg,        // principal still staked (active + matured deposits)
+        allDepositedAgg,           // all-time deposited principal
+        depositsByStatus,          // deposit counts by status
+        activeDeposits,            // for live (un-matured) yield computation
+      ] = await Promise.all([
+        YieldLogModel.aggregate([{ $match: { source: 'vault_apy' } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+        YieldLogModel.aggregate([{ $match: { source: { $in: ['referral_l1', 'referral_l2'] } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+        UserModel.aggregate([{ $group: { _id: null, usdt: { $sum: '$yieldWalletUSDT' }, usdc: { $sum: '$yieldWalletUSDC' } } }]),
+        UserModel.aggregate([{ $group: { _id: null, total: { $sum: '$referralEarnings' } } }]),
+        WithdrawRequestModel.aggregate([{ $match: { source: 'yield', status: 'completed' } }, { $group: { _id: null, gross: { $sum: '$amount' }, net: { $sum: '$netAmount' }, fees: { $sum: '$fee' }, count: { $sum: 1 } } }]),
+        WithdrawRequestModel.aggregate([{ $match: { source: 'referral', status: 'completed' } }, { $group: { _id: null, gross: { $sum: '$amount' }, net: { $sum: '$netAmount' }, count: { $sum: 1 } } }]),
+        WithdrawRequestModel.aggregate([{ $match: { source: 'deposit', status: 'completed' } }, { $group: { _id: null, gross: { $sum: '$amount' }, net: { $sum: '$netAmount' }, fees: { $sum: '$fee' }, count: { $sum: 1 }, earlyCount: { $sum: { $cond: ['$early', 1, 0] } } } }]),
+        WithdrawRequestModel.aggregate([{ $match: { status: 'pending' } }, { $group: { _id: '$source', gross: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+        DepositModel.aggregate([{ $match: { status: { $in: ['active', 'matured'] } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+        DepositModel.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
+        DepositModel.aggregate([{ $group: { _id: '$status', count: { $sum: 1 }, amount: { $sum: '$amount' } } }]),
+        DepositModel.find({ status: 'active' }).select('amount apyPercent maxYieldPayments createdAt').lean(),
+      ]);
+
+      // Live, un-matured yield across every active deposit (accruing in the current 30-day cycle).
+      let liveAccruing = 0;
+      for (const d of activeDeposits as any[]) liveAccruing += computeLiveCycleYield(d);
+
+      const wallet = walletBalances?.[0] || { usdt: 0, usdc: 0 };
+      const maturedOutstanding = Number(wallet.usdt || 0) + Number(wallet.usdc || 0);
+
+      const pending: any = { yield: { gross: 0, count: 0 }, deposit: { gross: 0, count: 0 }, referral: { gross: 0, count: 0 } };
+      for (const p of pendingByType as any[]) if (pending[p._id]) pending[p._id] = { gross: r6(p.gross), count: p.count };
+
+      const yw = yieldWithdrawnAgg?.[0] || {};
+      const rw = referralWithdrawnAgg?.[0] || {};
+      const pr = principalRedeemedAgg?.[0] || {};
+
+      return {
+        data: {
+          generatedAt: new Date().toISOString(),
+          yield: {
+            generatedAllTime: r6(sum(yieldGenerated)),      // total matured yield ever
+            maturationEvents: yieldGenerated?.[0]?.count || 0,
+            maturedOutstanding: r6(maturedOutstanding),      // matured, withdrawable, not yet withdrawn
+            maturedOutstandingByAsset: { USDT: r6(wallet.usdt), USDC: r6(wallet.usdc) },
+            liveAccruing: r6(liveAccruing),                  // un-matured, not yet withdrawable
+            withdrawnGross: r6(yw.gross), withdrawnNet: r6(yw.net), withdrawnCount: yw.count || 0,
+            pendingWithdrawal: pending.yield,
+          },
+          referral: {
+            generatedAllTime: r6(sum(referralGenerated)),
+            outstanding: r6(sum(referralOutstanding)),
+            withdrawnGross: r6(rw.gross), withdrawnNet: r6(rw.net), withdrawnCount: rw.count || 0,
+            pendingWithdrawal: pending.referral,
+          },
+          principal: {
+            activeStaked: r6(sum(activePrincipalAgg)), activeCount: activePrincipalAgg?.[0]?.count || 0,
+            allTimeDeposited: r6(sum(allDepositedAgg)),
+            redeemedGross: r6(pr.gross), redeemedNet: r6(pr.net), redeemedCount: pr.count || 0,
+            earlyExitCount: pr.earlyCount || 0, earlyExitFees: r6(pr.fees),
+            pendingRedemption: pending.deposit,
+            byStatus: (depositsByStatus as any[]).reduce((acc, s) => { acc[s._id] = { count: s.count, amount: r6(s.amount) }; return acc; }, {} as any),
+          },
+          feesCollected: r6(Number(pr.fees || 0)),           // all early-exit fees retained by treasury
+        },
+        error: null, message: 'Financial overview', status: 200,
+      };
     } catch (err: any) {
       return { data: null, error: err.message, message: 'Error', status: 500 };
     }
