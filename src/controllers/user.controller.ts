@@ -796,7 +796,6 @@ export default class UserController {
         lockUntil,
         apyPercent,
         tierIndex,
-        maxYieldPayments: vault.durationMonths,
       });
 
       // Update vault TVL

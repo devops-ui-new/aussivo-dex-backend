@@ -64,14 +64,14 @@ export const distributeMonthlyAPY = async () => {
 export const settleDepositYield = async (deposit: any, _opts: { log?: boolean } = {}): Promise<number> => {
   const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
   const monthlyYield = (deposit.amount * (deposit.apyPercent / 12)) / 100; // apyPercent is ANNUAL
-  const maxCycles = Number(deposit.maxYieldPayments || 0);
-  if (monthlyYield <= 0 || maxCycles <= 0) return 0;
+  if (monthlyYield <= 0) return 0;
 
   const createdMs = new Date(deposit.createdAt as any).getTime();
   const elapsedMs = Date.now() - createdMs;
 
-  // Whole 30-day cycles that have fully elapsed, capped at the deposit's term.
-  const completedCycles = Math.min(Math.floor(elapsedMs / CYCLE_MS), maxCycles);
+  // Whole 30-day cycles that have fully elapsed. There is NO term cap: a deposit keeps earning
+  // for as long as the principal remains staked. It only stops when the user redeems it.
+  const completedCycles = Math.floor(elapsedMs / CYCLE_MS);
   // Backward-compat: deposits created under the previous (continuous) model already had yield
   // credited (tracked in totalYieldPaid) but have cyclesMatured = 0. Treat the equivalent number
   // of already-paid cycles as matured so migration never re-credits them (idempotent on old data).
@@ -79,15 +79,7 @@ export const settleDepositYield = async (deposit: any, _opts: { log?: boolean } 
   const alreadyMatured = Math.max(Number(deposit.cyclesMatured || 0), paidCycles);
   const newCycles = completedCycles - alreadyMatured;
 
-  // Term is complete once every cycle has matured — principal stays redeemable, just no more yield.
-  const termComplete = completedCycles >= maxCycles;
-
-  if (newCycles <= 0) {
-    if (termComplete && deposit.status === 'active') {
-      await DepositModel.findByIdAndUpdate(deposit._id, { status: 'matured' });
-    }
-    return 0;
-  }
+  if (newCycles <= 0) return 0;
 
   const user = await UserModel.findById(deposit.userId);
   if (!user || user.status !== 'active') return 0;
@@ -105,7 +97,7 @@ export const settleDepositYield = async (deposit: any, _opts: { log?: boolean } 
       yieldPaymentsCount: newCycles,
     },
     cyclesMatured: completedCycles,
-    ...(termComplete ? { status: 'matured' } : {}),
+    // No term cap — the deposit stays 'active' and keeps earning until the user redeems it.
   });
 
   // A matured cycle is official accounting: always logged, and always pays referral commissions.
@@ -140,11 +132,9 @@ export const settleDepositYield = async (deposit: any, _opts: { log?: boolean } 
 export const computeLiveCycleYield = (deposit: any): number => {
   const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
   const monthlyYield = (deposit.amount * (deposit.apyPercent / 12)) / 100;
-  const maxCycles = Number(deposit.maxYieldPayments || 0);
-  if (monthlyYield <= 0 || maxCycles <= 0) return 0;
+  if (monthlyYield <= 0) return 0;
   const elapsedMs = Date.now() - new Date(deposit.createdAt as any).getTime();
-  const completedCycles = Math.min(Math.floor(elapsedMs / CYCLE_MS), maxCycles);
-  if (completedCycles >= maxCycles) return 0; // term done, nothing accruing
+  const completedCycles = Math.floor(elapsedMs / CYCLE_MS);
   const fracMs = elapsedMs - completedCycles * CYCLE_MS;
   return Math.max(0, monthlyYield * (fracMs / CYCLE_MS));
 };

@@ -18,11 +18,11 @@ const DepositSchema = new Schema({
   /** How much of THIS deposit's credited yield has already been withdrawn. */
   yieldWithdrawn: { type: Number, default: 0 },
   /**
-   * 30-day maturation model:
+   * 30-day maturation model (NO term cap — yield accrues for as long as the principal is staked):
    *  - cyclesMatured: whole 30-day cycles whose yield has already matured (credited to the
-   *    user's withdrawable yield wallet). Advances one per completed 30-day cycle, capped at
-   *    maxYieldPayments. Live (un-matured) yield for the CURRENT cycle is computed on the fly
-   *    and is NOT withdrawable until its cycle completes.
+   *    user's withdrawable yield wallet). Advances one per completed 30-day cycle, indefinitely.
+   *    Live (un-matured) yield for the CURRENT cycle is computed on the fly and is NOT
+   *    withdrawable until its cycle completes.
    *  - maturedYield: cumulative yield this deposit has matured (moved into the withdrawable bucket).
    *  - maturedYieldWithdrawn: portion of maturedYield the user has since withdrawn (audit only).
    */
@@ -30,7 +30,8 @@ const DepositSchema = new Schema({
   maturedYield: { type: Number, default: 0 },
   maturedYieldWithdrawn: { type: Number, default: 0 },
   yieldPaymentsCount: { type: Number, default: 0 },
-  maxYieldPayments: { type: Number, required: true },  // = vault durationMonths
+  // 'matured' is retained in the enum only for legacy documents written before the term cap
+  // was removed. New deposits stay 'active' until the user redeems them ('withdrawn').
   status: { type: String, enum: ['active', 'withdrawn', 'matured'], default: 'active' },
   withdrawnAt: { type: Date, default: null },
 }, { timestamps: true, versionKey: false });

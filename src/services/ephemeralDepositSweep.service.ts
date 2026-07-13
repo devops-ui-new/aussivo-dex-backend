@@ -276,7 +276,6 @@ export async function applyDepositAccounting(
       lockUntil,
       apyPercent,
       tierIndex,
-      maxYieldPayments: vault.durationMonths,
       status: "active",
     });
   } catch (e: any) {

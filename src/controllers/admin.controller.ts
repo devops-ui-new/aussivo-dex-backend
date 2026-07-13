@@ -485,7 +485,7 @@ export default class AdminController {
         DepositModel.aggregate([{ $match: { status: { $in: ['active', 'matured'] } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
         DepositModel.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
         DepositModel.aggregate([{ $group: { _id: '$status', count: { $sum: 1 }, amount: { $sum: '$amount' } } }]),
-        DepositModel.find({ status: 'active' }).select('amount apyPercent maxYieldPayments createdAt').lean(),
+        DepositModel.find({ status: 'active' }).select('amount apyPercent createdAt').lean(),
       ]);
 
       // Live, un-matured yield across every active deposit (accruing in the current 30-day cycle).

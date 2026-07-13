@@ -237,7 +237,6 @@ export class DepositListenerService {
             lockUntil,
             apyPercent,
             tierIndex,
-            maxYieldPayments: vault.durationMonths,
             status: "active",
           });
 
