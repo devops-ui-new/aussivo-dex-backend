@@ -31,6 +31,7 @@ import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/w
 import { settleUserYieldForAsset, settleDepositYield, computeLiveCycleYield } from "../helpers/apyDistribution.helper";
 import { fundEphemeralGas } from "../services/ephemeralDepositSweep.service";
 import { createTronEphemeral, fundTronEnergy } from "../services/tronDepositSweep.service";
+import { enqueueAttest } from "../services/chainSync.worker";
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
@@ -409,6 +410,9 @@ export default class UserController {
             totalReferralEarnings: totalReferralEarnings[0]?.total || 0,
             directReferrals,
           },
+          // True when the user has money invested but no wallet on file — the frontend uses this
+          // to prompt (once) for a wallet so their position can be attested on-chain.
+          needsWalletForAttestation: activeDeposits > 0 && !(user.walletAddress || "").trim(),
         },
         error: null,
         message: "User details retrieved",
@@ -1273,6 +1277,11 @@ export default class UserController {
       await existing.save();
 
       logger.info(`[AUTH] Wallet linked: ${existing.email} → ${normalized}`);
+
+      // If this user already has active deposits, attest their principal on-chain now that we
+      // finally have a wallet to key it by. Non-blocking; the outbox worker sends it.
+      void enqueueAttest(existing._id);
+
       return {
         data: { walletAddress: existing.walletAddress, walletAddresses: existing.walletAddresses },
         error: null,

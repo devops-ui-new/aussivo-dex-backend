@@ -17,6 +17,16 @@ router.get('/dashboard', authenticateAdmin, async (req: Request, res: Response) 
 router.get('/financial-overview', authenticateAdmin, async (req: Request, res: Response) => {
   const r = await new AdminController(req, res).getFinancialOverview(); return sendResponse(res, r.status, r);
 });
+// Chain health — signer gas, outbox stats, on-chain vs DB, last reconcile
+router.get('/chain-health', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).getChainHealth(); return sendResponse(res, r.status, r);
+});
+router.post('/chain-health/retry', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).retryChainOutbox(); return sendResponse(res, r.status, r);
+});
+router.post('/chain-health/reconcile', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).runReconcile(req.body?.markGlobal === true); return sendResponse(res, r.status, r);
+});
 
 // Vaults
 router.get('/vaults', authenticateAdmin, async (req: Request, res: Response) => {

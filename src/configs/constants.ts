@@ -104,6 +104,13 @@ export const EARLY_EXIT_FEE_BPS = Number(process.env.EARLY_EXIT_FEE_BPS || '100'
 export const REGISTRY_CONTRACT_ADDRESS = (process.env.REGISTRY_CONTRACT_ADDRESS || '').trim();
 export const REGISTRY_OWNER_PRIVATE_KEY = (process.env.REGISTRY_OWNER_PRIVATE_KEY || '').trim();
 
+// v2 attestation registry (per-address principal). Falls back to the v1 owner key if a dedicated
+// v2 key isn't set, since it's usually the same owner wallet.
+export const REGISTRY_V2_ADDRESS = (process.env.REGISTRY_V2_ADDRESS || '').trim();
+export const REGISTRY_V2_OWNER_PRIVATE_KEY = (process.env.REGISTRY_V2_OWNER_PRIVATE_KEY || process.env.REGISTRY_OWNER_PRIVATE_KEY || '').trim();
+// Minimum signer gas (BNB) before Chain Health flags a low-balance warning.
+export const CHAIN_MIN_GAS_BNB = parseFloat(process.env.CHAIN_MIN_GAS_BNB || '0.02');
+
 // On-chain deposit mirror token (18-dec ERC20). Accounting mirror only — NOT proof of reserves.
 export const STAKED_TOKEN_ADDRESS = (process.env.STAKED_TOKEN_ADDRESS || '').trim();
 export const STAKED_TOKEN_OWNER_PRIVATE_KEY = (process.env.STAKED_TOKEN_OWNER_PRIVATE_KEY || '').trim();

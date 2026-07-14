@@ -12,6 +12,8 @@ import { distributeMonthlyAPY } from './helpers/apyDistribution.helper';
 import { depositListener } from './services/depositListener.service';
 import { startEphemeralDepositSweep } from './services/ephemeralDepositSweep.service';
 import { startTronDepositSweep } from './services/tronDepositSweep.service';
+import { startChainSyncWorker } from './services/chainSync.worker';
+import { reconcileChain } from './services/chainReconcile.service';
 import Routes from './routes';
 import logger from './configs/logger.config';
 import { sendResponse } from './utils/response.util';
@@ -80,6 +82,19 @@ connectDB(async (mongooseConn) => {
     });
     startEphemeralDepositSweep();
     startTronDepositSweep();
+    startChainSyncWorker();
+
+    // Nightly on-chain reconciliation (03:30) — catches any user the live attest path missed
+    // and stamps the global aggregate so the contract matches the DB.
+    cron.schedule('30 3 * * *', async () => {
+      logger.info('[CRON] Running on-chain reconciliation...');
+      try {
+        const r = await reconcileChain({ markGlobal: true });
+        logger.info(`[CRON] Reconcile: checked=${r.checked} drifted=${r.drifted} requeued=${r.requeued}`);
+      } catch (err: any) {
+        logger.error('[CRON] Reconcile failed:', err.message);
+      }
+    });
   }
 
   // ── Start Server ──

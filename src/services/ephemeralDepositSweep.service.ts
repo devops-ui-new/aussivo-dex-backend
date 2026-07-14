@@ -18,6 +18,7 @@ import ActivityModel from "../models/activity.model";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
 import { registerUserOnChain } from "./userRegistry.service";
+import { enqueueAttest } from "./chainSync.worker";
 import { mintForDeposit } from "./stakedToken.service";
 
 const ERC20_ABI = [
@@ -298,6 +299,9 @@ export async function applyDepositAccounting(
 
   // On-chain deposit mirror: mint an equal amount so balanceOf(tracker) tracks total principal.
   void mintForDeposit(amount, String(deposit._id));
+
+  // Per-user principal attestation (v2) — durable, retried via the ChainOutbox worker.
+  void enqueueAttest(user._id);
 
   if (depositorAddresses.length) {
     const known = (user.walletAddresses || []).map((w: string) => normalizeAddr(w)).filter(Boolean);

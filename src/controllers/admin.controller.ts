@@ -17,6 +17,11 @@ import { getGasFunderStatus, forceSweepPending as forceSweepBep } from '../servi
 import { getTronGasFunderStatus, forceSweepPending as forceSweepTron } from '../services/tronDepositSweep.service';
 import { deregisterUserOnChain } from '../services/userRegistry.service';
 import { burnForWithdrawal } from '../services/stakedToken.service';
+import { enqueueAttest } from '../services/chainSync.worker';
+import ChainOutbox from '../models/chainOutbox.model';
+import { isRegistryV2Enabled, registryV2Signer, signerGasBnb, readGlobals } from '../services/registryV2.service';
+import { reconcileChain, getLastReconcileReport } from '../services/chainReconcile.service';
+import { CHAIN_MIN_GAS_BNB, REGISTRY_V2_ADDRESS } from '../configs/constants';
 import logger from '../configs/logger.config';
 
 export default class AdminController {
@@ -367,6 +372,9 @@ export default class AdminController {
               const u: any = await UserModel.findById(uid).select('walletAddress');
               if (u?.walletAddress) void deregisterUserOnChain(u.walletAddress);
             }
+
+            // v2 attestation: re-sync this user's principal on-chain (drops or lowers it).
+            void enqueueAttest(uid);
           }
         } else if (request.source === 'yield' && request.depositId) {
           // Per-deposit yield: now mark it withdrawn against that deposit.
@@ -429,6 +437,81 @@ export default class AdminController {
         ActivityModel.countDocuments(),
       ]);
       return { data: { logs, total, page, limit }, error: null, message: 'Activity logs', status: 200 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // ── CHAIN HEALTH ──
+  // Signer gas, outbox queue stats, on-chain vs DB aggregates, last reconcile. Powers the
+  // admin "Chain Health" tab so gas-outs and sync drift are visible before they bite.
+  async getChainHealth(): Promise<IResponse> {
+    try {
+      const [signer, gas, globals, dbAgg, counts] = await Promise.all([
+        Promise.resolve(registryV2Signer()),
+        signerGasBnb(),
+        readGlobals(),
+        DepositModel.aggregate([
+          { $match: { status: { $in: ['active', 'matured'] } } },
+          { $group: { _id: null, principal: { $sum: '$amount' }, n: { $sum: 1 } } },
+        ]),
+        ChainOutbox.aggregate([{ $group: { _id: '$status', c: { $sum: 1 } } }]),
+      ]);
+
+      const outbox: any = { pending: 0, processing: 0, done: 0, failed: 0 };
+      for (const row of counts as any[]) outbox[row._id] = row.c;
+
+      const recentFailures = await ChainOutbox.find({ status: 'failed' })
+        .sort({ updatedAt: -1 }).limit(10)
+        .select('kind walletAddress principalCents attempts lastError updatedAt');
+
+      const minGas = CHAIN_MIN_GAS_BNB;
+      const gasNum = gas != null ? parseFloat(gas) : null;
+
+      const dbPrincipal = Number((dbAgg as any[])[0]?.principal || 0);
+      const dbUsers = Number((dbAgg as any[])[0]?.n || 0);
+
+      return {
+        data: {
+          enabled: isRegistryV2Enabled(),
+          contract: REGISTRY_V2_ADDRESS || null,
+          signer: {
+            address: signer.address,
+            gasBnb: gas,
+            lowGas: gasNum != null && gasNum < minGas,
+            minGasBnb: minGas,
+          },
+          outbox,
+          recentFailures,
+          onChain: globals, // { totalUsers, totalPrincipalCents, lastGlobalSyncAt, apyBps }
+          database: { activeUsers: dbUsers, activePrincipal: dbPrincipal },
+          lastReconcile: getLastReconcileReport(),
+        },
+        error: null, message: 'Chain health', status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // Retry all failed outbox jobs (admin button).
+  async retryChainOutbox(): Promise<IResponse> {
+    try {
+      const res = await ChainOutbox.updateMany(
+        { status: 'failed' },
+        { $set: { status: 'pending', nextAttemptAt: new Date(), attempts: 0, lastError: '' } }
+      );
+      return { data: { requeued: res.modifiedCount }, error: null, message: 'Failed jobs re-queued', status: 200 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // Run reconciliation on demand (optionally stamp global sync on-chain).
+  async runReconcile(markGlobal: boolean): Promise<IResponse> {
+    try {
+      const report = await reconcileChain({ markGlobal });
+      return { data: report, error: null, message: 'Reconcile complete', status: 200 };
     } catch (err: any) {
       return { data: null, error: err.message, message: 'Error', status: 500 };
     }
