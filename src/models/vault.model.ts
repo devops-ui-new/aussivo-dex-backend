@@ -35,6 +35,10 @@ const VaultSchema = new Schema({
   smartContractLabel: { type: String, default: "Verified ✓" },
   circuitBreakerLabel: { type: String, default: "Active ✓" },
   tiers: { type: [TierSchema], required: true },
+  // Admin pin for the illustrative live-allocation theme (see helpers/allocationModel.ts).
+  // One of: stable-lending | delta-neutral | bluechip-lp | lsd-staking | rwa-yield.
+  // Leave blank to auto-derive from the vault name/id.
+  strategyTheme: { type: String, default: '' },
   strategies: [{
     name: { type: String, required: true },
     allocation: { type: Number, required: true },           // percentage
@@ -42,6 +46,9 @@ const VaultSchema = new Schema({
     color: { type: String, default: '' },                   // UI color hex
     apy: { type: String, default: '' },                     // display APY label e.g. "8.5%"
     status: { type: String, default: '' },                  // display status e.g. "Active"
+    category: { type: String, default: '' },                // e.g. "Lending", "Stable LP", "Reserve"
+    code: { type: String, default: '' },                    // 2-letter avatar override
+    contract: { type: String, default: '' },                // REAL venue address / subgraph id — fill when live
   }],
   contractAddress: { type: String, default: '' },
   status: { type: String, enum: ['active', 'paused', 'completed'], default: 'active' },

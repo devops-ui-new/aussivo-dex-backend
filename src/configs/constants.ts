@@ -120,3 +120,13 @@ export const STAKED_TOKEN_MEMO = (process.env.STAKED_TOKEN_MEMO || 'Aussivo depo
 
 // Frontend
 export const FRONTEND_URL = process.env.FRONTEND_URL || 'https://dex.aussivo.com';
+// ─── Illustrative live allocation model ──────────────────────────────────────
+// Drives the "Illustrative Target Allocation" panel and the pool-card weights with a
+// deterministic, wall-clock-based model (see helpers/allocationModel.ts). It is a TARGET
+// MODEL only — never presented as live on-chain positions. Enable it for demos.
+export const ALLOC_LIVE_MODEL = (process.env.ALLOC_LIVE_MODEL || 'false') === 'true';
+// How often constituents rotate. Default 24h (realistic). For an on-stage demo set a
+// short value like 20000 (20s) so an audience actually sees venues rotate.
+export const ALLOC_REBALANCE_MS = Number(process.env.ALLOC_REBALANCE_MS || String(24 * 60 * 60 * 1000));
+// Weight precision (still always sums to exactly 100).
+export const ALLOC_DECIMALS = Number(process.env.ALLOC_DECIMALS || '1');

@@ -8,8 +8,41 @@ import UserModel from '../models/user.model';
 import DepositModel from '../models/deposit.model';
 import WithdrawRequestModel from '../models/withdrawRequest.model';
 import { sendResponse } from '../utils/response.util';
+import { buildAllocation } from '../helpers/allocationModel';
+import { ALLOC_LIVE_MODEL, ALLOC_REBALANCE_MS, ALLOC_DECIMALS } from '../configs/constants';
 
 const router = express.Router();
+
+// Illustrative live allocation for a vault at the current instant. TARGET MODEL only —
+// deterministic (pure clock + vault id), never live on-chain positions. Returns the
+// strategies in the exact shape the frontend already renders, plus a little metadata.
+const liveAllocationFor = (v: any) => {
+  const r = buildAllocation(
+    { id: String(v._id), name: v.name, strategyTheme: v.strategyTheme },
+    { rebalancePeriodMs: ALLOC_REBALANCE_MS, decimals: ALLOC_DECIMALS }
+  );
+  return {
+    strategies: r.strategies.map((s) => ({
+      name: s.name,
+      allocation: s.allocation,
+      protocol: s.protocol,
+      color: s.color,
+      apy: s.apy,
+      status: s.status,
+      category: s.category,
+      code: s.code,
+      contract: s.contract,
+    })),
+    meta: {
+      live: true,
+      themeLabel: r.themeLabel,
+      blendedApy: r.blendedApy,
+      epoch: r.epoch,
+      rebalancePeriodMs: r.rebalancePeriodMs,
+      msToNextRebalance: r.msToNextRebalance,
+    },
+  };
+};
 
 router.use('/user', userRoutes);
 router.use('/admin', adminRoutes);
@@ -27,8 +60,14 @@ const formatVault = (v: any) => {
   const tierAnnual = v.tiers?.[0]?.apyPercent || 0;
   const annual = v.displayApy != null ? v.displayApy : tierAnnual;
   const monthly = v.displayApyMonthly != null ? v.displayApyMonthly : (annual / 12);
+
+  // When the live model is on, replace the stored strategies with the drifting,
+  // precise target allocation. When off, the DB strategies are served unchanged.
+  const live = ALLOC_LIVE_MODEL ? liveAllocationFor(v) : null;
+
   return {
   ...v.toObject ? v.toObject() : v,
+  ...(live ? { strategies: live.strategies, allocationMeta: live.meta } : { allocationMeta: { live: false } }),
   id: v._id,
   apy: Number(annual).toFixed(1),
   apyMonthly: Number(monthly).toFixed(2),
@@ -66,6 +105,20 @@ router.get('/pools/:id', async (req, res) => {
     const depositorCount = await DepositModel.countDocuments({ vaultId: req.params.id, status: 'active' });
     res.json({ ...formatVault(vault), depositorCount });
   } catch { res.status(404).json({ error: 'Not found' }); }
+});
+
+// /api/pools/:id/allocation → just the current illustrative allocation snapshot.
+// Small payload the frontend can poll every few seconds for the "live" feel without
+// re-fetching the whole vault. When the live model is off, returns the stored strategies.
+router.get('/pools/:id/allocation', async (req, res) => {
+  try {
+    const vault = await VaultModel.findById(req.params.id);
+    if (!vault) return res.status(404).json({ error: 'Not found' });
+    if (!ALLOC_LIVE_MODEL) {
+      return res.json({ strategies: (vault as any).strategies || [], meta: { live: false } });
+    }
+    return res.json(liveAllocationFor(vault));
+  } catch { return res.status(404).json({ error: 'Not found' }); }
 });
 
 // /api/stats → platform statistics.

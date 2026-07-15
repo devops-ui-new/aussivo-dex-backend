@@ -43,17 +43,23 @@ export const seedVaults = async () => {
         // the original 1.2–2.1%/month economics expressed as annual rates.
         displayApy: 18,
         displayApyMonthly: 1.5,
+        // Illustrative live-allocation theme (see helpers/allocationModel.ts). Used only
+        // when ALLOC_LIVE_MODEL=true; ignored otherwise.
+        strategyTheme: 'stable-lending',
         tiers: [
           { minAmount: MIN_DEPOSIT, maxAmount: 5000, apyPercent: 14.4 },
           { minAmount: 5000, maxAmount: 25000, apyPercent: 18 },
           { minAmount: 25000, maxAmount: 100000, apyPercent: 21.6 },
           { minAmount: 100000, maxAmount: 500000, apyPercent: 25.2 },
         ],
+        // `contract` is the REAL venue address / subgraph id — fill these in when the
+        // strategy goes live on-chain. Until then they stay empty and the panel shows
+        // the illustrative target model.
         strategies: [
-          { name: 'Aave V3 Lending', allocation: 40, protocol: 'Aave' },
-          { name: 'Compound Finance', allocation: 30, protocol: 'Compound' },
-          { name: 'Venus Protocol', allocation: 20, protocol: 'Venus' },
-          { name: 'Reserve Buffer', allocation: 10, protocol: 'Internal' },
+          { name: 'Aave V3 Lending',  allocation: 40, protocol: 'Aave',     color: '#00D395', category: 'Lending', code: 'Aa', apy: '', status: 'Active', contract: '' },
+          { name: 'Compound Finance', allocation: 30, protocol: 'Compound', color: '#0E8F6E', category: 'Lending', code: 'Co', apy: '', status: 'Active', contract: '' },
+          { name: 'Venus Protocol',   allocation: 20, protocol: 'Venus',    color: '#E8B10A', category: 'Lending', code: 'Ve', apy: '', status: 'Active', contract: '' },
+          { name: 'Reserve Buffer',   allocation: 10, protocol: 'Internal', color: '#F5A623', category: 'Reserve', code: 'Re', apy: '', status: 'Liquid', contract: '' },
         ],
         status: 'active',
       },
@@ -76,16 +82,17 @@ export const seedVaults = async () => {
         // ANNUAL APY % per tier (cron pays apyPercent/12 each month).
         displayApy: 12,
         displayApyMonthly: 1.0,
+        strategyTheme: 'delta-neutral',
         tiers: [
           { minAmount: MIN_DEPOSIT, maxAmount: 10000, apyPercent: 12 },
           { minAmount: 10000, maxAmount: 50000, apyPercent: 16.2 },
           { minAmount: 50000, maxAmount: 250000, apyPercent: 19.8 },
         ],
         strategies: [
-          { name: 'Funding Rate Arbitrage', allocation: 35, protocol: 'Binance' },
-          { name: 'Aave V3 Lending', allocation: 30, protocol: 'Aave' },
-          { name: 'Curve Stableswap', allocation: 25, protocol: 'Curve' },
-          { name: 'Insurance Reserve', allocation: 10, protocol: 'Internal' },
+          { name: 'Funding Rate Arbitrage', allocation: 35, protocol: 'Perps',    color: '#B6509E', category: 'Delta-Neutral', code: 'Fu', apy: '', status: 'Active', contract: '' },
+          { name: 'Aave V3 Lending',        allocation: 30, protocol: 'Aave',     color: '#00D395', category: 'Lending',       code: 'Aa', apy: '', status: 'Active', contract: '' },
+          { name: 'Curve Stableswap',       allocation: 25, protocol: 'Curve',    color: '#3457D5', category: 'Stable LP',     code: 'Cu', apy: '', status: 'Active', contract: '' },
+          { name: 'Insurance Reserve',      allocation: 10, protocol: 'Internal', color: '#F59E0B', category: 'Reserve',       code: 'In', apy: '', status: 'Liquid', contract: '' },
         ],
         status: 'active',
       },
