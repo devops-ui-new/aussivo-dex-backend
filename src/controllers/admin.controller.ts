@@ -288,17 +288,37 @@ export default class AdminController {
         DepositModel.find(query).populate('userId', 'name email walletAddress walletAddresses').populate('vaultId', 'name asset').sort({ createdAt: -1 }).skip(skip).limit(limit),
         DepositModel.countDocuments(query),
       ]);
-      return { data: { deposits, total, page, limit }, error: null, message: 'All deposits', status: 200 };
+      // Totals so the admin can see manual vs on-chain at a glance (across the whole filter).
+      const [manualCount, onchainCount] = await Promise.all([
+        DepositModel.countDocuments({ ...query, manual: true }),
+        DepositModel.countDocuments({ ...query, manual: { $ne: true } }),
+      ]);
+      return { data: { deposits, total, page, limit, manualCount, onchainCount }, error: null, message: 'All deposits', status: 200 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // Mark/unmark a deposit as a manual (admin-entered) settlement, for the origin badge.
+  async setDepositManual(depositId: string, manual: boolean): Promise<IResponse> {
+    try {
+      const dep = await DepositModel.findByIdAndUpdate(depositId, { manual: !!manual }, { new: true });
+      if (!dep) return { data: null, error: 'Not found', message: 'Deposit not found', status: 404 };
+      await ActivityModel.create({ adminId: this.adminId, title: manual ? 'Deposit flagged manual' : 'Deposit flagged on-chain', type: 'admin', metadata: { depositId, manual: !!manual, amount: dep.amount } });
+      return { data: { _id: dep._id, manual: dep.manual }, error: null, message: `Marked as ${manual ? 'manual' : 'on-chain'}`, status: 200 };
     } catch (err: any) {
       return { data: null, error: err.message, message: 'Error', status: 500 };
     }
   }
 
   // ── WITHDRAWAL MANAGEMENT ──
-  async getWithdrawRequests(page = 1, limit = 20, status?: string): Promise<IResponse> {
+  async getWithdrawRequests(page = 1, limit = 20, status?: string, source?: string): Promise<IResponse> {
     try {
       const query: any = {};
       if (status) query.status = status;
+      // Filter by kind of withdrawal so the admin can review Principal / Yield / Referral
+      // in separate tabs. `source`: 'deposit' (principal) | 'yield' | 'referral'.
+      if (source) query.source = source;
       const skip = (page - 1) * limit;
       const [requests, total] = await Promise.all([
         WithdrawRequestModel.find(query).populate('userId', 'name email walletAddress').sort({ createdAt: -1 }).skip(skip).limit(limit),
@@ -398,6 +418,56 @@ export default class AdminController {
       }
     } catch (err: any) {
       return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // ── BATCH PROCESS ──
+  // Approve or reject many requests in one call. Reuses the single-item processWithdrawal
+  // above (all its safety: atomic claim, on-chain payout with revert-on-failure, balance
+  // changes, attestations), run SEQUENTIALLY so concurrent on-chain payouts can't collide
+  // on the payout wallet's nonce. Returns a per-request result so the UI can show which
+  // ones succeeded and which failed — one bad request never blocks the rest.
+  async processWithdrawalsBatch(body: { requestIds: string[]; action: 'approve' | 'reject'; note?: string }): Promise<IResponse> {
+    try {
+      const { requestIds, action, note } = body || ({} as any);
+      if (!Array.isArray(requestIds) || requestIds.length === 0) {
+        return { data: null, error: 'Bad request', message: 'No requests selected', status: 400 };
+      }
+      if (action !== 'approve' && action !== 'reject') {
+        return { data: null, error: 'Bad request', message: 'Invalid action', status: 400 };
+      }
+      // De-duplicate while preserving order.
+      const ids = Array.from(new Set(requestIds.map(String)));
+
+      const results: Array<{ requestId: string; ok: boolean; status: number; message: string; txHash?: string }> = [];
+      for (const id of ids) {
+        // No per-item txHash in batch mode → auto-payout on approve (if configured).
+        const r = await this.processWithdrawal({ requestId: id, action, note });
+        results.push({
+          requestId: id,
+          ok: r.status === 200,
+          status: r.status,
+          message: r.message,
+          txHash: (r.data as any)?.txHash,
+        });
+      }
+
+      const succeeded = results.filter((r) => r.ok).length;
+      const failed = results.length - succeeded;
+      await ActivityModel.create({
+        adminId: this.adminId,
+        title: `Batch withdrawal ${action}`,
+        type: 'admin',
+        metadata: { action, total: results.length, succeeded, failed },
+      });
+
+      const message = failed === 0
+        ? `${succeeded} withdrawal${succeeded === 1 ? '' : 's'} ${action === 'approve' ? 'approved' : 'rejected'}`
+        : `${succeeded} succeeded, ${failed} failed`;
+      // 200 if any succeeded; 500 only if every one failed.
+      return { data: { results, succeeded, failed, total: results.length }, error: null, message, status: succeeded > 0 ? 200 : 500 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Batch process failed', status: 500 };
     }
   }
 

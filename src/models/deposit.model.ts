@@ -6,6 +6,12 @@ const DepositSchema = new Schema({
   amount: { type: Number, required: true },
   asset: { type: String, enum: ['USDT', 'USDC'], required: true },
   txHash: { type: String, default: '' },
+  /**
+   * Origin tracking. `manual` = the deposit was entered by an admin (off-chain / manual
+   * settlement), not captured automatically from an on-chain transfer. Used for the
+   * admin "Manual vs On-chain" badge and reconciliation.
+   */
+  manual: { type: Boolean, default: false },
   /** Ephemeral-flow idempotency + link to update txHash after treasury sweep. */
   pendingRequestId: { type: String, sparse: true, unique: true },
   walletAddress: { type: String, default: '' },

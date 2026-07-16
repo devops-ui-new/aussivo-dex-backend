@@ -5,7 +5,6 @@
  * This script DELETES NOTHING. It only recomputes yield from each deposit's true schedule and
  * rewrites the derived balances.
  *
- *   [1] VERIFY     — hard-stops if any deposit still lacks on-chain provenance (see WHY below).
  *   [2] REACTIVATE — status 'matured' -> 'active'. The old term cap is gone: a deposit earns
  *                    for as long as its principal stays staked.
  *   [3] RECOMPUTE  — rebuild cyclesMatured / maturedYield / totalYieldPaid / yieldPaymentsCount
