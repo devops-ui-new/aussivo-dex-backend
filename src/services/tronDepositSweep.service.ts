@@ -125,13 +125,58 @@ async function reclaimLeftoverTrx(address: string, privateKey: string): Promise<
   }
 }
 
+/**
+ * Confirm a Tron transaction actually SUCCEEDED on-chain before we treat the sweep as final.
+ * CRITICAL: TronWeb's contract .send() returns a txid at *broadcast* time — BEFORE the network
+ * executes it. A broadcast txid is NOT proof the USDT moved (the tx can still revert, e.g. out of
+ * energy). We must poll getTransactionInfo and require receipt SUCCESS. Only then is it safe to
+ * clear the ephemeral key. Getting this wrong is exactly how a key can be destroyed while the
+ * funds are still sitting on the address.
+ */
+async function confirmTronTx(txid: string, tries = 10, delayMs = 3000): Promise<boolean> {
+  if (!txid) return false;
+  const tron = makeTronWeb();
+  for (let i = 0; i < tries; i++) {
+    try {
+      const info: any = await tron.trx.getTransactionInfo(txid);
+      if (info && info.id) {
+        const ok =
+          info.receipt?.result === "SUCCESS" ||           // energy/contract result
+          (!info.receipt?.result && info.blockNumber);     // some nodes omit result on plain success
+        const reverted = info.receipt?.result && info.receipt.result !== "SUCCESS";
+        if (reverted) {
+          logger.warn(`[TronSweep] tx ${txid} on-chain result=${info.receipt.result} (reverted)`);
+          return false;
+        }
+        if (ok) return true;
+      }
+    } catch { /* not indexed yet — keep polling */ }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return false; // couldn't confirm success within the window — treat as NOT swept, keep the key
+}
+
+/** Read a USDT balance with retry/backoff so a transient 429 doesn't abort the whole tick. */
+async function getUsdtBalanceSafe(tron: TronWeb, address: string, tries = 4): Promise<number | null> {
+  for (let i = 0; i < tries; i++) {
+    try { return await getUsdtBalance(tron, address); }
+    catch (e: any) {
+      const status = e?.response?.status || e?.status;
+      if (status === 429 && i < tries - 1) { await new Promise((r) => setTimeout(r, 1500 * (i + 1))); continue; }
+      logger.warn(`[TronSweep] balance check failed ${address}: ${e?.message || e}`);
+      return null; // signal "unknown" — caller must NOT treat this as zero / must not purge
+    }
+  }
+  return null;
+}
+
 async function processOne(doc: any): Promise<void> {
   const tron = makeTronWeb();
   const address: string = doc.ephemeralAddress;
 
-  let balance = 0;
-  try { balance = await getUsdtBalance(tron, address); }
-  catch (e: any) { logger.warn(`[TronSweep] balance check failed ${address}: ${e?.message || e}`); return; }
+  const balanceMaybe = await getUsdtBalanceSafe(tron, address);
+  if (balanceMaybe === null) return; // 429/unknown — try again next tick; never assume empty
+  const balance = balanceMaybe;
   if (balance <= 0) return; // nothing arrived yet
 
   // 1) Credit the user (idempotent) via the shared accounting path — before the sweep.
@@ -190,17 +235,37 @@ async function processOne(doc: any): Promise<void> {
 
   try {
     const txid = await sweepToTreasury(address, pk, balance);
-    if (txid) {
-      await PendingDepositModel.findByIdAndUpdate(doc._id, {
-        status: "matched", matchedAt: new Date(), matchedTxHash: txid, sweepTxHash: txid,
-        privateKeyEncrypted: "", keyPurgedAt: new Date(),
-        privateKeyHash: doc.privateKeyHash || hashPrivateKeyHexFingerprint(pk),
-      });
-      // Recover the ephemeral's leftover TRX back to the funder (non-blocking, fail-safe).
-      await reclaimLeftoverTrx(address, pk);
+    if (!txid) return; // broadcast didn't even return an id — keep key, retry next tick
+
+    // Record the broadcast, but DO NOT purge the key yet. A txid means "submitted", not "succeeded".
+    await PendingDepositModel.findByIdAndUpdate(doc._id, {
+      sweepTxHash: txid, matchedTxHash: txid, matchedAt: new Date(),
+    });
+
+    // Only after the transfer is CONFIRMED SUCCESSFUL on-chain do we finalize + clear the key.
+    const confirmed = await confirmTronTx(txid);
+    if (!confirmed) {
+      // The USDT did NOT move (revert / unconfirmed). Keep the encrypted key so a later retry can
+      // still sweep. NEVER purge on an unconfirmed sweep — that is how funds get permanently locked.
+      logger.warn(`[TronSweep] sweep tx ${txid} for ${address} not confirmed — key preserved for retry`);
+      return;
     }
+
+    await PendingDepositModel.findByIdAndUpdate(doc._id, {
+      $set: {
+        status: "matched",
+        keyPurgedAt: new Date(),
+        privateKeyEncrypted: "", // safe to clear ONLY now — funds are confirmed in treasury
+      },
+      // privateKeyHash is audit material and MUST NEVER be removed. We do not $unset or overwrite it.
+    });
+    logger.info(`[TronSweep] Swept + confirmed ${balance} USDT ${address} → treasury tx=${txid}; key purged`);
+
+    // Recover the ephemeral's leftover TRX back to the funder (non-blocking, fail-safe).
+    await reclaimLeftoverTrx(address, pk);
   } catch (e: any) {
-    logger.warn(`[TronSweep] sweep failed ${address} (will retry): ${e?.message || e}`);
+    // Any failure here leaves privateKeyEncrypted intact by design → funds stay recoverable.
+    logger.warn(`[TronSweep] sweep failed ${address} (will retry, key preserved): ${e?.message || e}`);
   }
 }
 
@@ -208,13 +273,31 @@ async function tick(): Promise<void> {
   if (running) return;
   running = true;
   try {
-    const docs = await PendingDepositModel.find({
+    // Retire stale, unfunded, past-expiry intents so they stop clogging the scan (and stop
+    // spraying TronGrid). Only ones that never received funds and were never credited.
+    await PendingDepositModel.updateMany({
+      network: "trc20", status: "pending", expiresAt: { $lt: new Date() },
+      userCreditedAt: null, $or: [{ receivedAmount: 0 }, { receivedAmount: { $exists: false } }],
+    }, { $set: { status: "expired" } });
+
+    // Process ALL live docs across ticks — credited-but-unswept first, then newest pending.
+    // The old `.limit(25)` with no sort silently skipped everything past the 25th doc, which is
+    // how fresh deposits never got scanned. Sort + paginate guarantees every one is reached.
+    const PAGE = 20;
+    const base = {
       network: "trc20",
       status: { $in: ["pending", "credited"] },
       ephemeralAddress: { $exists: true, $nin: [null, ""] },
-    }).limit(25);
-    for (const doc of docs) {
-      try { await processOne(doc); } catch (e: any) { logger.warn(`[TronSweep] processOne error: ${e?.message || e}`); }
+    } as any;
+    const total = await PendingDepositModel.countDocuments(base);
+    for (let skip = 0; skip < total; skip += PAGE) {
+      const docs = await PendingDepositModel.find(base)
+        .sort({ userCreditedAt: 1, createdAt: -1 }) // credited-awaiting-sweep first, then newest
+        .skip(skip).limit(PAGE);
+      for (const doc of docs) {
+        try { await processOne(doc); } catch (e: any) { logger.warn(`[TronSweep] processOne error: ${e?.message || e}`); }
+        await new Promise((r) => setTimeout(r, 250)); // gentle throttle: stay under TronGrid's per-sec cap
+      }
     }
   } catch (e: any) {
     logger.warn(`[TronSweep] tick error: ${e?.message || e}`);

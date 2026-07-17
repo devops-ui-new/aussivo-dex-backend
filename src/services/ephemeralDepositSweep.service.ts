@@ -693,6 +693,8 @@ async function sweepOne(pendingArg: any): Promise<void> {
       { $set: { txHash: sweepTxHash } }
     );
 
+    // Safe to purge: the transfer above was confirmed (tx.wait(1), non-reverted receipt).
+    // We clear ONLY privateKeyEncrypted. privateKeyHash is audit-only and is NEVER removed.
     await PendingDepositModel.findByIdAndUpdate(latest._id, {
       $set: {
         status: "matched",
@@ -701,7 +703,7 @@ async function sweepOne(pendingArg: any): Promise<void> {
         matchedAt: new Date(),
         keyPurgedAt: new Date(),
       },
-      $unset: { privateKeyEncrypted: "" },
+      $unset: { privateKeyEncrypted: "" }, // NOTE: privateKeyHash intentionally preserved
     });
 
     logger.info(`[EphemeralSweep] Swept + purged key material for ${ephemeral} tx=${sweepTxHash}`);

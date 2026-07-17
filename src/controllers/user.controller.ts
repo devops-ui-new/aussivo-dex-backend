@@ -551,9 +551,12 @@ export default class UserController {
           expiresAt: expiresAtTron,
         });
 
-        // Pre-fund energy so the eventual sweep can pay for the USDT transfer.
-        const energyTx = await fundTronEnergy(tronAddress);
-        if (energyTx) await PendingDepositModel.findByIdAndUpdate(pendingTron._id, { gasFundTxHash: energyTx });
+        // Best-effort energy pre-fund. Energy is ALSO funded lazily at sweep time, so this must
+        // never block the response or throw — a TronGrid 429 here must not affect the deposit
+        // record in any way. Fire-and-forget (previously this ran inline and a 429 cascaded).
+        void fundTronEnergy(tronAddress)
+          .then((tx) => (tx ? PendingDepositModel.findByIdAndUpdate(pendingTron._id, { gasFundTxHash: tx }) : null))
+          .catch(() => { /* ignore — sweep will fund energy when needed */ });
 
         const qrTron = await QRCode.toDataURL(tronAddress, { width: 300, margin: 2, color: { dark: "#000000", light: "#ffffff" } });
 
@@ -573,7 +576,7 @@ export default class UserController {
             vaultName: vault.name,
             expiresAt: expiresAtTron.toISOString(),
             expiresInSeconds: Math.floor(INTENT_TTL_MS_TRON / 1000),
-            gasFundTxHash: energyTx || undefined,
+            gasFundTxHash: undefined, // energy pre-fund is async/best-effort now; not awaited here
             pendingDepositId: String(pendingTron._id),
           },
           error: null,
