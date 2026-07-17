@@ -47,6 +47,9 @@ router.get('/users', authenticateAdmin, async (req: Request, res: Response) => {
 router.get('/users/:id', authenticateAdmin, async (req: Request, res: Response) => {
   const r = await new AdminController(req, res).getUserById(req.params.id); return sendResponse(res, r.status, r);
 });
+router.get('/users/:id/profile', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).getUserProfile(req.params.id); return sendResponse(res, r.status, r);
+});
 
 // Deposits
 router.get('/deposits', authenticateAdmin, async (req: Request, res: Response) => {

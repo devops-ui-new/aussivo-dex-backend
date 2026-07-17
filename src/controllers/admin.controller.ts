@@ -277,6 +277,114 @@ export default class AdminController {
     }
   }
 
+  // Comprehensive 360° profile for support / dispute resolution: identity, balances, every
+  // deposit with a live 30-day-cycle yield breakdown (matured vs accruing vs next maturation),
+  // all withdrawal requests, recent yield payments, referral tree, and a wallet-consistency check.
+  async getUserProfile(userId: string): Promise<IResponse> {
+    try {
+      const user = await UserModel.findById(userId).select('-__v');
+      if (!user) return { data: null, error: 'Not found', message: 'User not found', status: 404 };
+
+      const [deposits, withdrawals, yieldLogs, referrals, referrer] = await Promise.all([
+        DepositModel.find({ userId }).populate('vaultId', 'name asset lockDays').sort({ createdAt: -1 }),
+        WithdrawRequestModel.find({ userId }).sort({ createdAt: -1 }),
+        YieldLogModel.find({ userId }).sort({ createdAt: -1 }).limit(50),
+        UserModel.find({ referredBy: userId }).select('name email createdAt totalDeposited'),
+        (user as any).referredBy ? UserModel.findById((user as any).referredBy).select('name email referralCode') : Promise.resolve(null),
+      ]);
+
+      const CYCLE = 30 * 24 * 60 * 60 * 1000;
+      const now = Date.now();
+      const r6 = (n: number) => Math.round(n * 1e6) / 1e6;
+      const asAsset = (a: any) => (a === 'USDC' ? 'USDC' : 'USDT');
+
+      const matured: any = { USDT: 0, USDC: 0 };
+      const accruing: any = { USDT: 0, USDC: 0 };
+      let activePrincipal = 0, totalEarnedToDate = 0, activeCount = 0, lockedCount = 0;
+
+      const depositView = (deposits as any[]).map((d) => {
+        const asset = asAsset(d.asset);
+        const amount = Number(d.amount || 0);
+        const apy = Number(d.apyPercent || 0);
+        const monthly = amount * (apy / 12) / 100;
+        const created = new Date(d.createdAt).getTime();
+        const withdrawnAt = d.status === 'withdrawn' && d.withdrawnAt ? new Date(d.withdrawnAt).getTime() : null;
+        const end = withdrawnAt ?? now;
+        const elapsed = Math.max(0, end - created);
+        const cycles = Math.floor(elapsed / CYCLE);
+        const maturedYield = r6(cycles * monthly);
+        const fracMs = elapsed - cycles * CYCLE;
+        const accruingNow = withdrawnAt ? 0 : r6(monthly * (fracMs / CYCLE));
+        const lockUntil = d.lockUntil ? new Date(d.lockUntil).getTime() : null;
+        const locked = !!(lockUntil && lockUntil > now);
+
+        totalEarnedToDate += maturedYield;
+        if (d.status !== 'withdrawn') {
+          activePrincipal += amount; activeCount++;
+          matured[asset] += maturedYield; accruing[asset] += accruingNow;
+          if (locked) lockedCount++;
+        }
+        return {
+          _id: d._id, amount, asset, apyPercent: apy, monthly: r6(monthly),
+          vault: d.vaultId?.name || '—', status: d.status, manual: !!d.manual, txHash: d.txHash || '',
+          createdAt: d.createdAt, lockUntil: d.lockUntil || null, locked, withdrawnAt: d.withdrawnAt || null,
+          cyclesMatured: cycles, maturedYield, accruing: accruingNow,
+          totalYieldPaid: Number(d.totalYieldPaid || 0),
+          cycleProgressPct: withdrawnAt ? 0 : Math.min(100, Math.round((fracMs / CYCLE) * 100)),
+          nextMaturationAt: withdrawnAt ? null : new Date(created + (cycles + 1) * CYCLE).toISOString(),
+          nextMaturationAmount: withdrawnAt ? 0 : r6(monthly),
+        };
+      });
+
+      const w = { yieldWithdrawnUSDT: 0, yieldWithdrawnUSDC: 0, principalRedeemed: 0, pending: 0, rejected: 0, completed: 0, approved: 0 };
+      for (const req of withdrawals as any[]) {
+        const asset = asAsset(req.asset); const amt = Number(req.amount || 0); const st = req.status;
+        if (st === 'completed') w.completed++; else if (st === 'pending') w.pending++;
+        else if (st === 'rejected') w.rejected++; else if (st === 'approved') w.approved++;
+        const nonRejected = ['completed', 'approved', 'pending'].includes(st);
+        if (nonRejected && req.source === 'yield') { if (asset === 'USDC') w.yieldWithdrawnUSDC += amt; else w.yieldWithdrawnUSDT += amt; }
+        if (st === 'completed' && req.source === 'deposit') w.principalRedeemed += amt;
+      }
+
+      const expectedWalletUSDT = r6(Math.max(0, matured.USDT - w.yieldWithdrawnUSDT));
+      const expectedWalletUSDC = r6(Math.max(0, matured.USDC - w.yieldWithdrawnUSDC));
+      const actualWalletUSDT = Number((user as any).yieldWalletUSDT || 0);
+      const actualWalletUSDC = Number((user as any).yieldWalletUSDC || 0);
+
+      const totals = {
+        activePrincipal: r6(activePrincipal),
+        totalDepositedAllTime: Number((user as any).totalDeposited || 0),
+        depositsCount: deposits.length, activeDepositsCount: activeCount, lockedCount,
+        maturedWithdrawableUSDT: r6(matured.USDT), maturedWithdrawableUSDC: r6(matured.USDC),
+        accruingUSDT: r6(accruing.USDT), accruingUSDC: r6(accruing.USDC),
+        totalYieldEarnedToDate: r6(totalEarnedToDate),
+        yieldWalletUSDT: actualWalletUSDT, yieldWalletUSDC: actualWalletUSDC,
+        totalWithdrawn: Number((user as any).totalWithdrawn || 0),
+        referralEarnings: Number((user as any).referralEarnings || 0),
+        withdrawals: w,
+        consistency: {
+          expectedWalletUSDT, actualWalletUSDT, matchUSDT: Math.abs(expectedWalletUSDT - actualWalletUSDT) < 0.01,
+          expectedWalletUSDC, actualWalletUSDC, matchUSDC: Math.abs(expectedWalletUSDC - actualWalletUSDC) < 0.01,
+        },
+      };
+
+      return {
+        data: {
+          user, totals, deposits: depositView, withdrawals, yieldLogs,
+          referral: {
+            code: (user as any).referralCode,
+            referredBy: referrer ? { name: (referrer as any).name, email: (referrer as any).email, code: (referrer as any).referralCode } : null,
+            referredCount: referrals.length, referredUsers: referrals,
+            earnings: Number((user as any).referralEarnings || 0),
+          },
+        },
+        error: null, message: 'User profile', status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
   // ── DEPOSIT MANAGEMENT ──
   async getAllDeposits(page = 1, limit = 20, vaultId?: string, status?: string): Promise<IResponse> {
     try {
