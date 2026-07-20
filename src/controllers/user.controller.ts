@@ -27,6 +27,7 @@ import {
   TRON_TREASURY_ADDRESS,
   TRON_USDT_CONTRACT,
   PERSISTENT_DEPOSIT_ADDRESSES,
+  STEP_UP_WINDOW_MINUTES,
 } from "../configs/constants";
 import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/walletCrypto.helper";
 import { settleUserYieldForAsset, settleDepositYield, computeLiveCycleYield } from "../helpers/apyDistribution.helper";
@@ -338,8 +339,12 @@ export default class UserController {
           status: 404,
         };
 
+      // Email OTP proves control of the account, so this is a FULL session:
+      // it may withdraw and link wallets.
+      // `verifiedAt` is what bounds the step-up window. The session itself still lasts
+      // 7 days — only the authority to withdraw expires.
       const token = jwt.sign(
-        { id: user._id, email: user.email, role: "user" },
+        { id: user._id, email: user.email, role: "user", authLevel: "otp", verifiedAt: Math.floor(Date.now() / 1000) },
         JWT_SECRET,
         { expiresIn: "7d" },
       );
@@ -347,6 +352,8 @@ export default class UserController {
       return {
         data: {
           token,
+          authLevel: "otp",
+          verifiedFor: STEP_UP_WINDOW_MINUTES,
           user: {
             id: user._id,
             name: user.name,
@@ -898,102 +905,11 @@ export default class UserController {
     }
   }
 
-  // ── RECORD DEPOSIT (called after on-chain confirmation or manual admin approval) ──
-  async recordDeposit(body: {
-    vaultId: string;
-    amount: number;
-    txHash?: string;
-  }): Promise<IResponse> {
-    try {
-      const { vaultId, amount, txHash } = body;
-      const user = await UserModel.findById(this.userId);
-      if (!user)
-        return {
-          data: null,
-          error: "User not found",
-          message: "User not found",
-          status: 404,
-        };
-
-      const vault = await VaultModel.findById(vaultId);
-      if (!vault || vault.status !== "active")
-        return {
-          data: null,
-          error: "Vault not available",
-          message: "Vault not available",
-          status: 400,
-        };
-
-      // Determine tier
-      let tierIndex = 0;
-      let apyPercent = vault.tiers[0]?.apyPercent || 0;
-      for (let i = vault.tiers.length - 1; i >= 0; i--) {
-        if (amount >= vault.tiers[i].minAmount) {
-          tierIndex = i;
-          apyPercent = vault.tiers[i].apyPercent;
-          break;
-        }
-      }
-
-      const lockUntil =
-        vault.lockDays > 0
-          ? new Date(Date.now() + vault.lockDays * 86400000)
-          : null;
-
-      const deposit = await DepositModel.create({
-        userId: user._id,
-        vaultId: vault._id,
-        amount,
-        asset: vault.asset,
-        txHash: txHash || "",
-        walletAddress: user.walletAddress,
-        depositorAddresses: user.walletAddress ? [user.walletAddress] : [],
-        lockUntil,
-        apyPercent,
-        tierIndex,
-      });
-
-      // Update vault TVL
-      await VaultModel.findByIdAndUpdate(vault._id, {
-        $inc: { totalStaked: amount, totalUsers: 1 },
-      });
-
-      // Update user balance
-      const balField = vault.asset === "USDT" ? "usdtBalance" : "usdcBalance";
-      await UserModel.findByIdAndUpdate(user._id, {
-        $inc: { [balField]: amount, totalDeposited: amount },
-      });
-
-      await ActivityModel.create({
-        userId: user._id,
-        title: "Deposit Confirmed",
-        description: `$${amount} ${vault.asset} deposited into ${vault.name}`,
-        type: "deposit",
-        metadata: { vaultId, depositId: deposit._id, amount },
-      });
-
-      return {
-        data: {
-          depositId: deposit._id,
-          amount,
-          asset: vault.asset,
-          vault: vault.name,
-          apyPercent,
-          lockUntil,
-        },
-        error: null,
-        message: "Deposit recorded successfully",
-        status: 201,
-      };
-    } catch (err: any) {
-      return {
-        data: null,
-        error: err.message,
-        message: "Deposit failed",
-        status: 500,
-      };
-    }
-  }
+  // ── recordDeposit REMOVED ──
+  // It credited an arbitrary `amount` from the request body with no on-chain
+  // verification, no duplicate check and no bounds check, so any authenticated user
+  // could mint themselves a balance. Deposits are now only ever created from an
+  // observed on-chain transfer (depositAddress.service / the chain scanners).
 
   // ── USER DEPOSITS ──
   async getDeposits(page = 1, limit = 10): Promise<IResponse> {
@@ -1160,10 +1076,49 @@ export default class UserController {
     depositId?: string;
   }): Promise<IResponse> {
     try {
-      const { amount, asset, source, walletAddress, depositId } = body;
+      const { amount, asset, source, depositId } = body;
       const user = await UserModel.findById(this.userId);
       if (!user)
         return { data: null, error: "Not found", message: "User not found", status: 404 };
+
+      // ── PAYOUT ADDRESS MUST BELONG TO THIS USER ──
+      // Previously this came straight from the request body and was never checked, so a
+      // caller could direct someone else's funds to their own wallet. The destination is
+      // now constrained to wallets already linked to the authenticated account, and must
+      // be a well-formed address.
+      let walletAddress: string;
+      {
+        const raw = String((body as any).walletAddress || "").trim();
+        if (!raw)
+          return { data: null, error: "Missing wallet", message: "A payout wallet address is required", status: 400 };
+
+        let normalized: string;
+        try {
+          normalized = ethers.getAddress(raw).toLowerCase();
+        } catch {
+          return { data: null, error: "Invalid wallet", message: "Payout address is not a valid wallet address", status: 400 };
+        }
+
+        const linked = new Set<string>(
+          [
+            ...(user.walletAddresses || []).map((w: string) => (w || "").trim().toLowerCase()),
+            (user.walletAddress || "").trim().toLowerCase(),
+          ].filter(Boolean)
+        );
+
+        if (!linked.has(normalized)) {
+          logger.warn(
+            `[WITHDRAW] Rejected payout to unlinked address. user=${user.email} requested=${normalized}`
+          );
+          return {
+            data: null,
+            error: "Unlinked wallet",
+            message: "Withdrawals can only be sent to a wallet linked to your account. Link it first, then try again.",
+            status: 403,
+          };
+        }
+        walletAddress = ethers.getAddress(normalized); // checksummed for the payout tx
+      }
 
       const CYCLE_MS = 30 * 24 * 60 * 60 * 1000;
       const FEE_RATE = EARLY_EXIT_FEE_BPS / 10000; // 100 bps → 0.01
@@ -1289,27 +1244,29 @@ export default class UserController {
    * If wallet is registered → issue JWT immediately (no OTP).
    * First-time users must go through email+OTP registration.
    */
+  /**
+   * Wallet auto-login — unchanged UX: connect a known wallet, get a session.
+   *
+   * SECURITY MODEL. A wallet address is public, so this cannot prove who the caller is.
+   * The session it issues is therefore LIMITED (authLevel 'wallet'): it can browse the
+   * portfolio, but it cannot move money or attach a new payout wallet. Those actions
+   * require a session verified by email OTP (authLevel 'otp').
+   *
+   * That split is what keeps the convenience without the drain path: even if someone
+   * reads a depositor address off a block explorer and gets a session, they cannot link
+   * their own wallet and cannot withdraw.
+   */
   async walletAuth(body: { walletAddress: string }): Promise<IResponse> {
     try {
       const { walletAddress } = body;
       if (!walletAddress)
-        return {
-          data: null,
-          error: "Wallet required",
-          message: "Wallet address required",
-          status: 400,
-        };
+        return { data: null, error: "Wallet required", message: "Wallet address required", status: 400 };
 
       let normalized: string;
       try {
-        normalized = ethers.getAddress(walletAddress.trim()).toLowerCase();
+        normalized = ethers.getAddress(String(walletAddress).trim()).toLowerCase();
       } catch {
-        return {
-          data: null,
-          error: "Invalid wallet",
-          message: "Valid wallet address required",
-          status: 400,
-        };
+        return { data: null, error: "Invalid wallet", message: "Valid wallet address required", status: 400 };
       }
 
       const user = await UserModel.findOne({
@@ -1317,30 +1274,26 @@ export default class UserController {
         $or: [{ walletAddress: normalized }, { walletAddresses: normalized }],
       });
       if (!user) {
-        // Not registered — frontend should show email + OTP once
-        return {
-          data: { registered: false },
-          error: null,
-          message: "Wallet not registered",
-          status: 200,
-        };
+        return { data: { registered: false }, error: null, message: "Wallet not registered", status: 200 };
       }
 
-      // Returning user — issue JWT directly, no OTP needed
+      // Limited session. `authLevel` is what the withdraw/link-wallet guards check.
       const token = jwt.sign(
-        { id: user._id, email: user.email, role: "user" },
+        { id: user._id, email: user.email, role: "user", authLevel: "wallet" },
         JWT_SECRET,
-        { expiresIn: "7d" },
+        { expiresIn: "7d" }
       );
 
-      logger.info(
-        `[AUTH] Wallet auto-login: ${user.email} (${normalized.slice(0, 10)}...)`,
-      );
+      logger.info(`[AUTH] Wallet session (limited): ${user.email} (${normalized.slice(0, 10)}…)`);
 
+      const [local, domain] = user.email.split("@");
       return {
         data: {
           registered: true,
           token,
+          authLevel: "wallet",
+          // Tells the frontend a withdrawal will need an email code, and where it goes.
+          maskedEmail: local[0] + "***@" + domain,
           user: {
             id: user._id,
             name: user.name,
@@ -1356,12 +1309,7 @@ export default class UserController {
       };
     } catch (err: any) {
       logger.error("walletAuth error:", err);
-      return {
-        data: null,
-        error: err.message,
-        message: "Authentication failed",
-        status: 500,
-      };
+      return { data: null, error: err.message, message: "Authentication failed", status: 500 };
     }
   }
 

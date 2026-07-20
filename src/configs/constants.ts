@@ -197,3 +197,12 @@ export const DEPOSIT_BALANCE_FALLBACK_CHAINS =
   (process.env.DEPOSIT_BALANCE_FALLBACK_CHAINS || 'bep20').split(',').map((c) => c.trim()).filter(Boolean);
 /** Give the log scanner this long to book it properly first. */
 export const DEPOSIT_BALANCE_FALLBACK_DELAY_MS = Number(process.env.DEPOSIT_BALANCE_FALLBACK_DELAY_MS || '30000');
+
+/**
+ * How long an email-OTP verification authorises withdrawals.
+ *
+ * After this window a further withdrawal asks for a fresh code. The user stays logged in
+ * throughout — only money-moving actions re-verify. Shorter is safer: it bounds how long
+ * a device left unattended (or a stolen token) can move funds.
+ */
+export const STEP_UP_WINDOW_MINUTES = Number(process.env.STEP_UP_WINDOW_MINUTES || '30');

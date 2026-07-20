@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import UserController from '../controllers/user.controller';
 import { sendResponse } from '../utils/response.util';
-import { authenticateUser } from '../middlewares/auth.middleware';
+import { authenticateUser, requireVerifiedSession } from '../middlewares/auth.middleware';
 import { otpSendRateLimit, otpVerifyRateLimit } from '../middlewares/otpRateLimit.middleware';
 const router = express.Router();
 
@@ -15,7 +15,7 @@ router.post('/verify-otp', otpVerifyRateLimit, async (req: Request, res: Respons
 router.post('/wallet-login', otpSendRateLimit, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).walletLogin(req.body); return sendResponse(res, r.status, r);
 });
-router.post('/wallet-auth', async (req: Request, res: Response) => {
+router.post('/wallet-auth', otpVerifyRateLimit, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).walletAuth(req.body); return sendResponse(res, r.status, r);
 });
 
@@ -23,7 +23,7 @@ router.post('/wallet-auth', async (req: Request, res: Response) => {
 router.get('/me', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).getUserDetails(); return sendResponse(res, r.status, r);
 });
-router.post('/link-wallet', authenticateUser, async (req: Request, res: Response) => {
+router.post('/link-wallet', authenticateUser, requireVerifiedSession, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).linkWallet(req.body); return sendResponse(res, r.status, r);
 });
 
@@ -47,9 +47,6 @@ router.post('/deposit/pending/cancel', authenticateUser, async (req: Request, re
   const r = await new UserController(req, res).cancelPendingDeposit(req.body);
   return sendResponse(res, r.status, r);
 });
-router.post('/deposit/confirm', authenticateUser, async (req: Request, res: Response) => {
-  const r = await new UserController(req, res).recordDeposit(req.body); return sendResponse(res, r.status, r);
-});
 router.get('/deposits', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).getDeposits(Number(req.query.page) || 1, Number(req.query.limit) || 10); return sendResponse(res, r.status, r);
 });
@@ -64,7 +61,7 @@ router.get('/withdrawals', authenticateUser, async (req: Request, res: Response)
 router.get('/referrals', authenticateUser, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).getReferralData(); return sendResponse(res, r.status, r);
 });
-router.post('/withdraw', authenticateUser, async (req: Request, res: Response) => {
+router.post('/withdraw', authenticateUser, requireVerifiedSession, async (req: Request, res: Response) => {
   const r = await new UserController(req, res).requestWithdraw(req.body); return sendResponse(res, r.status, r);
 });
 
