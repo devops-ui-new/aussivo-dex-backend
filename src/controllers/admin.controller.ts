@@ -21,6 +21,16 @@ import { enqueueAttest } from '../services/chainSync.worker';
 import ChainOutbox from '../models/chainOutbox.model';
 import { isRegistryV2Enabled, registryV2Signer, signerGasBnb, readGlobals } from '../services/registryV2.service';
 import { reconcileChain, getLastReconcileReport } from '../services/chainReconcile.service';
+import DepositAddressModel from '../models/depositAddress.model';
+import ScannerStateModel from '../models/scannerState.model';
+import DepositCreditModel from '../models/depositCredit.model';
+import DepositSweepModel from '../models/depositSweep.model';
+import { forceSweepAddress as sweepAddressNow, recoverFromAddress } from '../services/persistentSweep.service';
+import { rescanTrc20Address } from '../services/depositScannerTrc20.service';
+import { rescanBep20Range } from '../services/depositScannerBep20.service';
+import { describeKeyCustody } from '../helpers/depositKey.helper';
+import { ethers } from 'ethers';
+import { BSC_PROVIDER_URL, BSC_CHAIN_ID, PERSISTENT_DEPOSIT_ADDRESSES, TRON_GAS_TOPUP_TRX } from '../configs/constants';
 import { CHAIN_MIN_GAS_BNB, REGISTRY_V2_ADDRESS } from '../configs/constants';
 import logger from '../configs/logger.config';
 
@@ -82,47 +92,271 @@ export default class AdminController {
 
   // ── DEPOSIT SWEEP MONITOR ──
   // Per-chain view of what's in-flight and whether a gas funder is the bottleneck.
+  // ── DEPOSIT & SWEEP HEALTH (unified: legacy + persistent) ─────────────────
+  // One page that answers three questions without the admin having to interpret
+  // anything: is money at risk right now, is anything blocked, and what do I click.
+  //
+  // `alerts` is the contract with the UI — severity-ranked, each with a concrete
+  // action. The UI renders them verbatim so backend and frontend can never disagree
+  // about what counts as an emergency.
   async getSweepStatus(): Promise<IResponse> {
     try {
       const now = Date.now();
-      const notSwept = { $or: [{ sweepTxHash: "" }, { sweepTxHash: { $exists: false } }] };
       const STUCK_MS = 3 * 60 * 1000;
+      const notSwept = { $or: [{ sweepTxHash: "" }, { sweepTxHash: { $exists: false } }] };
+      const legacyOnly = { depositAddressId: { $in: [null, undefined] } };
+      const r6 = (n: any) => Math.round(Number(n || 0) * 1e6) / 1e6;
 
-      const perChain = async (network: 'bep20' | 'trc20') => {
-        const [awaitingDeposit, awaitingSweep, swept, expired, stuckDocs] = await Promise.all([
-          PendingDepositModel.countDocuments({ network, status: 'pending', expiresAt: { $gt: new Date(now) } }),
-          PendingDepositModel.countDocuments({ network, status: 'credited', ...notSwept }),
-          PendingDepositModel.countDocuments({ network, status: 'matched' }),
-          PendingDepositModel.countDocuments({ network, status: 'expired' }),
-          PendingDepositModel.find({
-            network, status: 'credited', ...notSwept,
-            userCreditedAt: { $lt: new Date(now - STUCK_MS) },
-          }).select('ephemeralAddress asset receivedAmount expectedAmount userCreditedAt energyFundedAt').sort({ userCreditedAt: 1 }).limit(50).lean(),
-        ]);
-        const stuck = stuckDocs.map((d: any) => ({
-          id: String(d._id),
-          address: d.ephemeralAddress,
-          asset: d.asset,
-          amount: d.receivedAmount || d.expectedAmount || 0,
-          waitingMinutes: d.userCreditedAt ? Math.round((now - new Date(d.userCreditedAt).getTime()) / 60000) : null,
-          lastFundedAt: d.energyFundedAt || null,
-        }));
-        return { awaitingDeposit, awaitingSweep, swept, expired, stuckCount: stuck.length, stuck };
+      const toBig = (v: any): bigint => {
+        let str = String(v ?? '0').trim();
+        if (!str || str === '0') return 0n;
+        if (/[eE]/.test(str)) {
+          const [mant, expRaw] = str.split(/[eE]/);
+          const exp = parseInt(expRaw, 10);
+          const [i, f = ''] = mant.replace(/^[-+]/, '').split('.');
+          const digits = i + f;
+          const pad = exp - f.length;
+          str = pad >= 0 ? digits + '0'.repeat(pad) : digits.slice(0, digits.length + pad);
+        }
+        str = str.split('.')[0];
+        try { return BigInt(str); } catch { return 0n; }
       };
 
-      const [bep20, trc20, bscFunder, tronFunder] = await Promise.all([
-        perChain('bep20'), perChain('trc20'), getGasFunderStatus(), getTronGasFunderStatus(),
+      // ── LEGACY (ephemeral) per chain ──
+      const legacyChain = async (network: 'bep20' | 'trc20') => {
+        const [openSessions, awaitingSweep, swept, expired, stuckDocs] = await Promise.all([
+          PendingDepositModel.countDocuments({ network, status: 'pending', expiresAt: { $gt: new Date(now) }, ...legacyOnly }),
+          PendingDepositModel.countDocuments({ network, status: 'credited', ...notSwept, ...legacyOnly }),
+          PendingDepositModel.countDocuments({ network, status: 'matched', ...legacyOnly }),
+          PendingDepositModel.countDocuments({ network, status: 'expired', ...legacyOnly }),
+          PendingDepositModel.find({
+            network, status: 'credited', ...notSwept, ...legacyOnly,
+            userCreditedAt: { $lt: new Date(now - STUCK_MS) },
+          })
+            .select('ephemeralAddress asset receivedAmount expectedAmount userCreditedAt energyFundedAt privateKeyEncrypted')
+            .sort({ userCreditedAt: 1 }).limit(50).lean(),
+        ]);
+
+        const stuck = stuckDocs.map((d: any) => {
+          const hasKey = !!d.privateKeyEncrypted;
+          return {
+            id: String(d._id),
+            address: d.ephemeralAddress,
+            asset: d.asset,
+            amount: r6(d.receivedAmount || d.expectedAmount || 0),
+            waitingMinutes: d.userCreditedAt ? Math.round((now - new Date(d.userCreditedAt).getTime()) / 60000) : null,
+            lastFundedAt: d.energyFundedAt || null,
+            hasKey,
+            // A purged key means force-sweep CANNOT work. Say so instead of offering a
+            // button that silently fails.
+            canForceSweep: hasKey,
+            blockedReason: hasKey ? null : 'Private key was purged — force sweep cannot work. Restore the key from a database snapshot.',
+          };
+        });
+
+        return { openSessions, awaitingSweep, swept, expired, stuckCount: stuck.length, stuck };
+      };
+
+      // ── PERSISTENT (deposit_addresses) per chain ──
+      const persistentChain = async (network: 'bep20' | 'trc20') => {
+        const rows: any[] = await DepositAddressModel.find({ network, status: 'active' })
+          .select('address creditedTotal sweptTotal creditsCount lastSweepError sweepFailureCount unexplainedBalanceSince userId')
+          .populate('userId', 'email')
+          .lean();
+
+        const dec = network === 'trc20' ? 6 : 18;
+        const human = (v: bigint) => Number(v) / 10 ** dec;
+
+        let credited = 0n, swept = 0n, withFunds = 0;
+        const blocked: any[] = [];
+
+        for (const r of rows) {
+          const c = toBig(r.creditedTotal);
+          const w = toBig(r.sweptTotal);
+          credited += c; swept += w;
+          const owed = c > w ? c - w : 0n;
+          if (owed > 0n) {
+            withFunds++;
+            blocked.push({
+              id: String(r._id),
+              address: r.address,
+              email: (r.userId as any)?.email || '',
+              awaiting: r6(human(owed)),
+              lastError: r.lastSweepError || '',
+              failures: r.sweepFailureCount || 0,
+              // Persistent addresses ALWAYS have a recoverable key by design.
+              canForceSweep: true,
+            });
+          }
+        }
+
+        const unexplained = rows.filter((r) => r.unexplainedBalanceSince).length;
+
+        return {
+          addresses: rows.length,
+          creditedTotal: r6(human(credited)),
+          sweptTotal: r6(human(swept)),
+          awaitingSweepTotal: r6(human(credited > swept ? credited - swept : 0n)),
+          addressesAwaitingSweep: withFunds,
+          unexplained,
+          blocked: blocked.sort((a, b) => b.awaiting - a.awaiting).slice(0, 50),
+        };
+      };
+
+      const [
+        legacyBep, legacyTron, persBep, persTron,
+        bscFunder, tronFunder, creditsPending, creditsFailed, cursors,
+      ] = await Promise.all([
+        legacyChain('bep20'), legacyChain('trc20'),
+        persistentChain('bep20'), persistentChain('trc20'),
+        getGasFunderStatus(), getTronGasFunderStatus(),
+        DepositCreditModel.countDocuments({ status: 'detected' }),
+        DepositCreditModel.countDocuments({ status: 'failed' }),
+        ScannerStateModel.find({ key: { $regex: '^bep20:' } }).lean(),
       ]);
 
-      // A funder that's low AND has deposits awaiting sweep = the reason things are stuck.
-      const bscBlocked = bscFunder ? !bscFunder.ok && bep20.awaitingSweep > 0 : bep20.awaitingSweep > 0;
-      const tronBlocked = tronFunder ? !tronFunder.ok && trc20.awaitingSweep > 0 : trc20.awaitingSweep > 0;
+      // ── Scanner lag: a held cursor means deposits are NOT being detected ──
+      let scanner: any = { enabled: PERSISTENT_DEPOSIT_ADDRESSES, tokens: [] as any[], maxLagBlocks: 0, lastError: '' };
+      if (PERSISTENT_DEPOSIT_ADDRESSES) {
+        let head = 0;
+        try {
+          const url = BSC_PROVIDER_URL.split(',')[0].trim();
+          const prov = new ethers.JsonRpcProvider(url, BSC_CHAIN_ID, { staticNetwork: true });
+          head = await prov.getBlockNumber();
+        } catch { /* leave head 0 */ }
+        scanner.headBlock = head;
+        for (const c of cursors as any[]) {
+          const lag = head && c.lastScannedBlock ? Math.max(0, head - c.lastScannedBlock) : 0;
+          scanner.tokens.push({
+            key: c.key, lastScannedBlock: c.lastScannedBlock, lagBlocks: lag,
+            lastError: c.lastError || '', lastRunAt: c.lastRunAt,
+          });
+          if (lag > scanner.maxLagBlocks) scanner.maxLagBlocks = lag;
+          if (c.lastError) scanner.lastError = c.lastError;
+        }
+      }
+
+      // ── ALERTS — severity-ranked, each with a concrete action ──
+      const alerts: any[] = [];
+
+      const purged = [...legacyBep.stuck, ...legacyTron.stuck].filter((s: any) => !s.hasKey);
+      if (purged.length) {
+        const total = purged.reduce((a: number, b: any) => a + b.amount, 0);
+        alerts.push({
+          level: 'critical',
+          title: `$${r6(total)} stranded with a purged key`,
+          detail: `${purged.length} legacy address(es) hold funds but the key was deleted. Force sweep cannot work — the key must be restored from a database snapshot.`,
+          action: 'Restore from MongoDB Atlas snapshot',
+        });
+      }
+
+      if (creditsFailed > 0) {
+        alerts.push({
+          level: 'critical',
+          title: `${creditsFailed} deposit(s) failed to credit`,
+          detail: 'Funds are safe on the deposit address, but the user cannot see them yet.',
+          action: 'Check Deposit Addresses → rescan',
+        });
+      }
+
+      const bscBlocked = bscFunder ? !bscFunder.ok : false;
+      const tronBlocked = tronFunder ? !tronFunder.ok : false;
+      const bscNeeds = legacyBep.awaitingSweep > 0 || persBep.addressesAwaitingSweep > 0;
+      const tronNeeds = legacyTron.awaitingSweep > 0 || persTron.addressesAwaitingSweep > 0;
+
+      if (bscBlocked && bscNeeds) {
+        alerts.push({
+          level: 'critical',
+          title: 'BSC gas funder is empty — sweeps are blocked',
+          detail: `${bscFunder?.bnb ?? '0'} BNB left. Users are credited; funds just aren't reaching treasury yet.`,
+          action: `Send BNB to ${bscFunder?.address || 'the gas funder'}`,
+        });
+      } else if (bscBlocked) {
+        alerts.push({
+          level: 'warning',
+          title: 'BSC gas funder is low',
+          detail: `${bscFunder?.bnb ?? '0'} BNB left. Nothing blocked yet.`,
+          action: `Top up ${bscFunder?.address || 'the gas funder'}`,
+        });
+      }
+
+      if (tronBlocked && tronNeeds) {
+        alerts.push({
+          level: 'critical',
+          title: 'Tron gas funder is empty — sweeps are blocked',
+          detail: `${tronFunder?.trx ?? '0'} TRX left. Each sweep needs about ${TRON_GAS_TOPUP_TRX} TRX.`,
+          action: `Send TRX to ${tronFunder?.address || 'the gas funder'}`,
+        });
+      } else if (tronBlocked) {
+        alerts.push({
+          level: 'warning',
+          title: 'Tron gas funder is low',
+          detail: `${tronFunder?.trx ?? '0'} TRX left. Nothing blocked yet.`,
+          action: `Top up ${tronFunder?.address || 'the gas funder'}`,
+        });
+      }
+
+      if (PERSISTENT_DEPOSIT_ADDRESSES && scanner.maxLagBlocks > 500) {
+        alerts.push({
+          level: 'critical',
+          title: 'Deposit scanner is behind',
+          detail: `New deposits aren't being picked up yet. Nothing is lost — the scanner replays the range once the RPC responds.`,
+          action: 'Set BSC_PROVIDER_URL to a dedicated RPC provider',
+        });
+      } else if (PERSISTENT_DEPOSIT_ADDRESSES && scanner.lastError) {
+        alerts.push({
+          level: 'warning',
+          title: 'Deposit scanner is retrying a block range',
+          detail: 'Retrying a block range. Nothing can be missed; crediting is just delayed.',
+          action: 'Consider a dedicated BSC RPC endpoint',
+        });
+      }
+
+      const unexplainedTotal = persBep.unexplained + persTron.unexplained;
+      if (unexplainedTotal > 0) {
+        alerts.push({
+          level: 'warning',
+          title: `${unexplainedTotal} address(es) hold more than has been credited`,
+          detail: 'The uncredited portion is held back deliberately, so no user can be shorted.',
+          action: 'Deposit Addresses → rescan',
+        });
+      }
+
+      if (creditsPending > 3) {
+        alerts.push({
+          level: 'warning',
+          title: `${creditsPending} credit(s) queued`,
+          detail: 'Normally clears within a minute.',
+          action: 'Watch — escalate if it does not drain',
+        });
+      }
+
+      if (!PERSISTENT_DEPOSIT_ADDRESSES) {
+        alerts.push({
+          level: 'info',
+          title: 'Persistent deposit addresses are disabled',
+          detail: 'Deposits still use one-time addresses that expire.',
+          action: 'Set PERSISTENT_DEPOSIT_ADDRESSES=true when ready',
+        });
+      }
+
+      const order: any = { critical: 0, warning: 1, info: 2 };
+      alerts.sort((a, b) => order[a.level] - order[b.level]);
 
       return {
         data: {
           generatedAt: new Date(now).toISOString(),
-          bep20: { ...bep20, gasFunder: bscFunder, funderBlocking: bscBlocked },
-          trc20: { ...trc20, gasFunder: tronFunder, funderBlocking: tronBlocked },
+          persistentEnabled: PERSISTENT_DEPOSIT_ADDRESSES,
+          alerts,
+          criticalCount: alerts.filter((a) => a.level === 'critical').length,
+          scanner,
+          credits: { pending: creditsPending, failed: creditsFailed },
+          funders: {
+            bep20: bscFunder ? { ...bscFunder, unit: 'BNB', blocking: bscBlocked && bscNeeds } : null,
+            trc20: tronFunder ? { ...tronFunder, unit: 'TRX', blocking: tronBlocked && tronNeeds } : null,
+          },
+          persistent: { bep20: persBep, trc20: persTron },
+          legacy: { bep20: legacyBep, trc20: legacyTron },
         },
         error: null, message: 'Sweep status', status: 200,
       };
@@ -795,6 +1029,201 @@ export default class AdminController {
       };
     } catch (err: any) {
       return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  // ═══ PERSISTENT DEPOSIT ADDRESSES ═══════════════════════════════════════
+  // Every user's permanent deposit address, with a credited-vs-swept reconciliation
+  // and proof that its key is still recoverable. This is the operational safety net
+  // the old ephemeral flow lost the moment it purged a key.
+
+  async getDepositAddresses(page = 1, limit = 25, search?: string): Promise<IResponse> {
+    try {
+      const query: any = { status: 'active' };
+      if (search) {
+        const users = await UserModel.find({
+          $or: [
+            { name: { $regex: search, $options: 'i' } },
+            { email: { $regex: search, $options: 'i' } },
+          ],
+        }).select('_id');
+        query.$or = [
+          { address: { $regex: search, $options: 'i' } },
+          { userId: { $in: users.map((u) => u._id) } },
+        ];
+      }
+
+      const skip = (page - 1) * limit;
+      const [rows, total] = await Promise.all([
+        DepositAddressModel.find(query)
+          .populate('userId', 'name email')
+          .populate('activeVaultId', 'name asset')
+          .sort({ updatedAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .lean(),
+        DepositAddressModel.countDocuments(query),
+      ]);
+
+      const toBig = (v: any): bigint => {
+        let str = String(v ?? '0').trim();
+        if (!str || str === '0') return 0n;
+        if (/[eE]/.test(str)) {
+          const [mant, expRaw] = str.split(/[eE]/);
+          const exp = parseInt(expRaw, 10);
+          const [i, f = ''] = mant.replace(/^[-+]/, '').split('.');
+          const digits = i + f;
+          const pad = exp - f.length;
+          str = pad >= 0 ? digits + '0'.repeat(pad) : digits.slice(0, digits.length + pad);
+        }
+        str = str.split('.')[0];
+        try { return BigInt(str); } catch { return 0n; }
+      };
+
+      const addresses = rows.map((r: any) => {
+        const credited = toBig(r.creditedTotal);
+        const swept = toBig(r.sweptTotal);
+        const owed = credited > swept ? credited - swept : 0n;
+        const dec = r.network === 'trc20' ? 6 : 18;
+        const human = (v: bigint) => Number(v) / 10 ** dec;
+        return {
+          _id: r._id,
+          address: r.address,
+          network: r.network,
+          user: r.userId,
+          vault: r.activeVaultId,
+          keySource: r.keySource,
+          // True by construction — keys are never purged. Surfaced so it is provable.
+          recoverable: r.keySource === 'hd' || !!r.privateKeyEncrypted,
+          creditsCount: r.creditsCount || 0,
+          creditedTotal: human(credited),
+          sweptTotal: human(swept),
+          awaitingSweep: human(owed),
+          lastActivityAt: r.lastActivityAt,
+          lastSweepAt: r.lastSweepAt,
+          lastSweepTxHash: r.lastSweepTxHash,
+          lastSweepError: r.lastSweepError,
+          sweepFailureCount: r.sweepFailureCount || 0,
+          // Non-null = an inflow the scanner has not booked yet. Investigate.
+          unexplainedBalanceSince: r.unexplainedBalanceSince,
+        };
+      });
+
+      const [creditsPending, creditsFailed, sweepsFailed, unexplained] = await Promise.all([
+        DepositCreditModel.countDocuments({ status: 'detected' }),
+        DepositCreditModel.countDocuments({ status: 'failed' }),
+        DepositSweepModel.countDocuments({ status: 'failed' }),
+        DepositAddressModel.countDocuments({ unexplainedBalanceSince: { $ne: null } }),
+      ]);
+
+      return {
+        data: {
+          addresses, total, page, limit,
+          custody: describeKeyCustody(),
+          health: { creditsPending, creditsFailed, sweepsFailed, unexplained },
+        },
+        error: null, message: 'Deposit addresses', status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  /** Full credit + sweep history for one address (support / dispute resolution). */
+  async getDepositAddressDetail(addressId: string): Promise<IResponse> {
+    try {
+      const addr: any = await DepositAddressModel.findById(addressId)
+        .populate('userId', 'name email walletAddress')
+        .populate('activeVaultId', 'name asset')
+        .lean();
+      if (!addr) return { data: null, error: 'Not found', message: 'Address not found', status: 404 };
+
+      const [credits, sweeps] = await Promise.all([
+        DepositCreditModel.find({ addressId }).sort({ createdAt: -1 }).limit(100).lean(),
+        DepositSweepModel.find({ addressId }).sort({ createdAt: -1 }).limit(100).lean(),
+      ]);
+
+      // Never leak key material to the client.
+      delete addr.privateKeyEncrypted;
+
+      return {
+        data: {
+          address: { ...addr, recoverable: addr.keySource === 'hd' || true },
+          credits, sweeps,
+        },
+        error: null, message: 'Address detail', status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: 'Error', status: 500 };
+    }
+  }
+
+  /** Force an immediate sweep attempt (re-funds gas if needed). */
+  async forceSweepDepositAddress(addressId: string): Promise<IResponse> {
+    try {
+      await sweepAddressNow(addressId);
+      const fresh: any = await DepositAddressModel.findById(addressId).lean();
+      await ActivityModel.create({
+        adminId: this.adminId, title: 'Deposit address sweep forced', type: 'admin',
+        metadata: { addressId, txHash: fresh?.lastSweepTxHash || null },
+      });
+      return {
+        data: { lastSweepTxHash: fresh?.lastSweepTxHash || null, lastSweepError: fresh?.lastSweepError || '' },
+        error: null,
+        message: fresh?.lastSweepError ? `Retry attempted: ${fresh.lastSweepError}` : 'Sweep attempted',
+        status: 200,
+      };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: `Force sweep failed: ${err.message}`, status: 500 };
+    }
+  }
+
+  /** Re-read on-chain history for one address and book anything missing. Idempotent. */
+  async rescanDepositAddress(addressId: string, blocks?: number): Promise<IResponse> {
+    try {
+      const doc: any = await DepositAddressModel.findById(addressId).lean();
+      if (!doc) return { data: null, error: 'Not found', message: 'Address not found', status: 404 };
+
+      if (doc.network === 'trc20') {
+        await rescanTrc20Address(addressId);
+      } else {
+        // EVM scanning is range-based, not per-address: re-scan a recent window.
+        const span = Number(blocks || 200_000); // ~7 days on BSC
+        const url = BSC_PROVIDER_URL.split(',')[0].trim();
+        const p = new ethers.JsonRpcProvider(url, BSC_CHAIN_ID, { staticNetwork: true });
+        const head = await p.getBlockNumber();
+        await rescanBep20Range(Math.max(1, head - span), head);
+      }
+      await ActivityModel.create({
+        adminId: this.adminId, title: 'Deposit address rescanned', type: 'admin', metadata: { addressId },
+      });
+      return { data: { rescanned: true }, error: null, message: 'Rescan complete', status: 200 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: `Rescan failed: ${err.message}`, status: 500 };
+    }
+  }
+
+  /**
+   * MANUAL RECOVERY — move funds off a deposit address to any destination.
+   * superadmin only (enforced in the route). Every call is logged loudly.
+   * This is the escape hatch that makes stranded funds always retrievable.
+   */
+  async recoverDepositAddressFunds(addressId: string, destination: string, amount?: number): Promise<IResponse> {
+    try {
+      if (!destination || typeof destination !== 'string' || !destination.trim()) {
+        return { data: null, error: 'Bad request', message: 'destination is required', status: 400 };
+      }
+      const result = await recoverFromAddress(addressId, destination.trim(), amount);
+      logger.warn(`[ADMIN] Funds recovered from ${addressId} → ${destination} by admin ${this.adminId}`);
+      await ActivityModel.create({
+        adminId: this.adminId,
+        title: 'Deposit address funds recovered',
+        type: 'admin',
+        metadata: { addressId, destination, amount: result.amount, txHash: result.txHash },
+      });
+      return { data: result, error: null, message: `Recovered ${result.amount}`, status: 200 };
+    } catch (err: any) {
+      return { data: null, error: err.message, message: `Recovery failed: ${err.message}`, status: 500 };
     }
   }
 }

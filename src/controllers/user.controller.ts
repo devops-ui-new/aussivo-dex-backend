@@ -26,12 +26,14 @@ import {
   EARLY_EXIT_FEE_BPS,
   TRON_TREASURY_ADDRESS,
   TRON_USDT_CONTRACT,
+  PERSISTENT_DEPOSIT_ADDRESSES,
 } from "../configs/constants";
 import { encryptPrivateKeyHex, hashPrivateKeyHexFingerprint } from "../helpers/walletCrypto.helper";
 import { settleUserYieldForAsset, settleDepositYield, computeLiveCycleYield } from "../helpers/apyDistribution.helper";
 import { fundEphemeralGas } from "../services/ephemeralDepositSweep.service";
 import { createTronEphemeral, fundTronEnergy } from "../services/tronDepositSweep.service";
 import { enqueueAttest } from "../services/chainSync.worker";
+import { getOrCreateDepositAddress, setActiveVault } from "../services/depositAddress.service";
 import { IResponse } from "../utils/response.util";
 import { sendEmail } from "../configs/email.config";
 import logger from "../configs/logger.config";
@@ -470,11 +472,157 @@ export default class UserController {
     }
   }
 
+  // ── DEPOSIT (persistent per-user address) ──────────────────────────────────
+  // Returns the user's ONE permanent deposit address for the chosen chain. The
+  // address never expires and its key is never purged, so funds sent at any time
+  // — including long after the UI closed — are always detected and recoverable.
+  //
+  // The response shape is intentionally identical to the legacy one so the
+  // frontend needs no change. `expiresAt` is omitted, which DepositQR.jsx already
+  // treats as "no countdown".
+  async getDepositQR(body: {
+    vaultId: string;
+    amount?: number;
+    network?: "bep20" | "trc20";
+  }): Promise<IResponse> {
+    // Feature flag OFF → original code path, untouched.
+    if (!PERSISTENT_DEPOSIT_ADDRESSES) {
+      return this.getDepositQRLegacy(body);
+    }
+
+    try {
+      const { vaultId } = body;
+      const network: "bep20" | "trc20" = body.network === "trc20" ? "trc20" : "bep20";
+
+      const vault = await VaultModel.findById(vaultId);
+      if (!vault || vault.status !== "active") {
+        return {
+          data: null,
+          error: "Vault not available",
+          message: "Vault not found or inactive",
+          status: 404,
+        };
+      }
+
+      if (network === "trc20") {
+        if (vault.asset !== "USDT") {
+          return { data: null, error: "Unsupported", message: "TRC20 supports USDT only", status: 400 };
+        }
+        if (!TRON_TREASURY_ADDRESS) {
+          return { data: null, error: "Server misconfigured", message: "TRC20 deposits are not enabled yet", status: 503 };
+        }
+      }
+
+      // The permanent address. Created once, reused forever.
+      const addrDoc = await getOrCreateDepositAddress(this.userId as string, network);
+      await setActiveVault(addrDoc._id, vault._id);
+
+      // A lightweight session row, purely so the existing status-polling endpoint
+      // and the modal auto-close keep working. It holds NO key material and no
+      // expiry semantics that could lose money.
+      const requestId =
+        network === "trc20"
+          ? `tron_${randomBytes(24).toString("hex")}`
+          : `0x${randomBytes(32).toString("hex")}`;
+
+      await PendingDepositModel.updateMany(
+        { userId: this.userId, network, depositAddressId: addrDoc._id, status: "pending" },
+        { $set: { status: "expired" } }
+      );
+
+      const pendingDoc = await PendingDepositModel.create({
+        userId: this.userId,
+        vaultId,
+        expectedAmount: 0,
+        expectedAmountBaseUnits: "0",
+        requestId,
+        asset: vault.asset,
+        network,
+        walletAddress: network === "bep20" ? addrDoc.addressLookup : "",
+        ephemeralAddress: addrDoc.address, // reused field name; now a permanent address
+        depositAddressId: addrDoc._id,     // marks this row as NOT legacy
+        openAmount: true,
+        privateKeyEncrypted: "",           // key lives in deposit_addresses, never here
+        privateKeyHash: addrDoc.privateKeyHash,
+        // Schema requires expiresAt. The SESSION expires; the ADDRESS never does.
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      });
+
+      const qrCode = await QRCode.toDataURL(addrDoc.address, {
+        width: 300,
+        margin: 2,
+        color: { dark: "#000000", light: "#ffffff" },
+      });
+
+      const common = {
+        qrCode,
+        qrPayload: addrDoc.address,
+        qrPayloadAddressOnly: addrDoc.address,
+        depositAddress: addrDoc.address,
+        openAmount: true,
+        amount: null,
+        amountInBaseUnits: "0",
+        requestId,
+        asset: vault.asset,
+        vaultName: vault.name,
+        pendingDepositId: String(pendingDoc._id),
+        persistent: true,
+        neverExpires: true,
+        // expiresAt / expiresInSeconds intentionally omitted → no countdown rendered.
+      };
+
+      if (network === "trc20") {
+        return {
+          data: {
+            ...common,
+            tokenAddress: TRON_USDT_CONTRACT,
+            network: "Tron (TRC-20)",
+            networkKey: "trc20",
+          },
+          error: null,
+          message: "Deposit address ready",
+          status: 200,
+        };
+      }
+
+      const TOKEN_ADDRESSES: Record<string, string> = {
+        USDT: USDT_CONTRACT_ADDRESS,
+        USDC: USDC_CONTRACT_ADDRESS,
+      };
+
+      return {
+        data: {
+          ...common,
+          tokenAddress: TOKEN_ADDRESSES[vault.asset],
+          qrEip681: addrDoc.address,
+          network:
+            BSC_CHAIN_ID === 56
+              ? "BNB Smart Chain (BEP-20)"
+              : "BSC Testnet (BEP-20, chainId 97)",
+          networkKey: "bep20",
+          chainId: BSC_CHAIN_ID,
+          chainIdHex: `0x${BSC_CHAIN_ID.toString(16)}`,
+        },
+        error: null,
+        message: "Deposit address ready",
+        status: 200,
+      };
+    } catch (err: any) {
+      logger.error(`[getDepositQR] ${err?.message || err}`);
+      return {
+        data: null,
+        error: err.message,
+        message: "Error generating deposit address",
+        status: 500,
+      };
+    }
+  }
+
   // ── DEPOSIT (ephemeral address + QR; server sweeps to treasury after payment) ──
   // `amount` is OPTIONAL. When omitted/0 the address is "open-amount": the user simply
   // scans and sends any amount from their wallet, and the sweep service captures and
   // credits whatever arrives, fast (no upfront amount, no exact-match required).
-  async getDepositQR(body: {
+  async getDepositQRLegacy(body: {
     vaultId: string;
     amount?: number;
     network?: "bep20" | "trc20";

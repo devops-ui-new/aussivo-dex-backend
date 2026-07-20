@@ -277,7 +277,8 @@ async function tick(): Promise<void> {
     // spraying TronGrid). Only ones that never received funds and were never credited.
     await PendingDepositModel.updateMany({
       network: "trc20", status: "pending", expiresAt: { $lt: new Date() },
-      userCreditedAt: null, $or: [{ receivedAmount: 0 }, { receivedAmount: { $exists: false } }],
+      userCreditedAt: null, depositAddressId: { $in: [null, undefined] },
+      $or: [{ receivedAmount: 0 }, { receivedAmount: { $exists: false } }],
     }, { $set: { status: "expired" } });
 
     // Process ALL live docs across ticks — credited-but-unswept first, then newest pending.
@@ -288,6 +289,7 @@ async function tick(): Promise<void> {
       network: "trc20",
       status: { $in: ["pending", "credited"] },
       ephemeralAddress: { $exists: true, $nin: [null, ""] },
+      depositAddressId: { $in: [null, undefined] }, // persistent-address rows handled by persistentSweep
     } as any;
     const total = await PendingDepositModel.countDocuments(base);
     for (let skip = 0; skip < total; skip += PAGE) {

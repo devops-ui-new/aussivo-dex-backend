@@ -1,0 +1,42 @@
+{
+  "generatedAt": "2026-07-20T06:53:19.160Z",
+  "total": 12245.0002362,
+  "found": [
+    {
+      "address": "TUBwPQxEpccQj9xVwaWLFMv4w4LkPvUA1q",
+      "network": "trc20",
+      "status": "credited",
+      "asset": "USDT",
+      "amount": 12245,
+      "hasKey": false,
+      "credited": true,
+      "swept": false,
+      "email": "supreet.malhotra@yahoo.com",
+      "createdAt": "2026-07-17T12:06:09.319Z"
+    },
+    {
+      "address": "0x916bd8d9feacdf323dd599d8581652189c97a28c",
+      "network": "bep20",
+      "status": "matched",
+      "asset": "USDT",
+      "amount": 0.0001332,
+      "hasKey": false,
+      "credited": true,
+      "swept": true,
+      "email": "parveenmehmi7@gmail.com",
+      "createdAt": "2026-06-29T04:49:13.146Z"
+    },
+    {
+      "address": "0x529f7514e823f222a75f062fae663798d0507fa0",
+      "network": "bep20",
+      "status": "matched",
+      "asset": "USDT",
+      "amount": 0.000103,
+      "hasKey": false,
+      "credited": true,
+      "swept": true,
+      "email": "kirpalfzr@gmail.com",
+      "createdAt": "2026-06-22T04:35:13.178Z"
+    }
+  ]
+}

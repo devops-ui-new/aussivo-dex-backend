@@ -2,6 +2,17 @@ import express, { Request, Response } from 'express';
 import AdminController from '../controllers/admin.controller';
 import { sendResponse } from '../utils/response.util';
 import { authenticateAdmin, authenticateCron } from '../middlewares/auth.middleware';
+
+// Recovery can move funds to an arbitrary address — the single most dangerous
+// endpoint in the system. Gate it behind superadmin on top of authenticateAdmin.
+const requireSuperadmin = (req: Request, res: Response, next: any) => {
+  if (req.body?.admin?.role !== 'superadmin') {
+    return sendResponse(res, 403, {
+      data: null, error: 'Forbidden', message: 'Superadmin access required', status: 403,
+    });
+  }
+  next();
+};
 const router = express.Router();
 
 // Auth
@@ -106,6 +117,31 @@ router.get('/activity-logs', authenticateAdmin, async (req: Request, res: Respon
 // Cron endpoint
 router.post('/cron/distribute-apy', authenticateCron, async (req: Request, res: Response) => {
   const r = await new AdminController(req, res).triggerAPYDistribution(); return sendResponse(res, r.status, r);
+});
+
+// ═══ Persistent deposit addresses ═══
+router.get('/deposit-addresses', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).getDepositAddresses(
+    Number(req.query.page) || 1, Number(req.query.limit) || 25, req.query.search as string);
+  return sendResponse(res, r.status, r);
+});
+router.get('/deposit-addresses/:id', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).getDepositAddressDetail(req.params.id);
+  return sendResponse(res, r.status, r);
+});
+router.post('/deposit-addresses/:id/sweep', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).forceSweepDepositAddress(req.params.id);
+  return sendResponse(res, r.status, r);
+});
+router.post('/deposit-addresses/:id/rescan', authenticateAdmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).rescanDepositAddress(req.params.id, Number(req.body?.blocks) || undefined);
+  return sendResponse(res, r.status, r);
+});
+// SUPERADMIN ONLY — moves funds to an arbitrary destination.
+router.post('/deposit-addresses/:id/recover', authenticateAdmin, requireSuperadmin, async (req: Request, res: Response) => {
+  const r = await new AdminController(req, res).recoverDepositAddressFunds(
+    req.params.id, req.body?.destination, req.body?.amount != null ? Number(req.body.amount) : undefined);
+  return sendResponse(res, r.status, r);
 });
 
 export default router;

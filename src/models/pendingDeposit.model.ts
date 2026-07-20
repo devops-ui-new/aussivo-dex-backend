@@ -10,6 +10,9 @@ const PendingDepositSchema = new Schema(
     asset: { type: String, enum: ["USDT", "USDC"], required: true },
     /** Which chain the deposit address is on. bep20 = BSC/EVM, trc20 = Tron. */
     network: { type: String, enum: ["bep20", "trc20"], default: "bep20", index: true },
+    /** Set when this intent points at a PERSISTENT deposit address (deposit_addresses).
+     *  Legacy ephemeral rows never have it — that is how the two sweepers stay separated. */
+    depositAddressId: { type: Types.ObjectId, ref: "deposit_addresses", default: null, index: true },
     /** Legacy: user wallet hint for old vault-contract flow. Optional for ephemeral deposits. */
     walletAddress: { type: String, default: "", lowercase: true, index: true },
     /** One-time deposit address (QR); funds swept to treasury after detection.

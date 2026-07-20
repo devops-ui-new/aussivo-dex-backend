@@ -67,10 +67,10 @@ export const REPORTS_API_KEY = (process.env.REPORTS_API_KEY || '').trim();
 
 /** Canonical BSC USDT/USDC — all use 18 decimals. Avoids flaky `decimals()` eth_call on public RPC. */
 const CANONICAL_BSC_STABLE_DECIMALS: Record<string, number> = {
-  '0x55d398326f99059f775485246999027b3197955': 18, // mainnet USDT
+  '0x55d398326f99059ff775485246999027b3197955': 18, // mainnet USDT
   '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 18, // mainnet USDC
   '0x337610d27c682e347c9cd60bd4b3b107c9d34ddd': 18, // testnet USDT
-  '0x64544969ed7ebbf5f083679233325356ebe738930': 18, // testnet USDC
+  '0x64544969ed7ebf5f083679233325356ebe738930': 18, // testnet USDC
 };
 
 /** Returns 18 for known BSC stables, else `null` (caller may fall back to 18 or read on-chain). */
@@ -130,3 +130,59 @@ export const ALLOC_LIVE_MODEL = (process.env.ALLOC_LIVE_MODEL || 'false') === 't
 export const ALLOC_REBALANCE_MS = Number(process.env.ALLOC_REBALANCE_MS || String(24 * 60 * 60 * 1000));
 // Weight precision (still always sums to exactly 100).
 export const ALLOC_DECIMALS = Number(process.env.ALLOC_DECIMALS || '1');
+
+// ─── Persistent per-user deposit addresses ──────────────────────────────────
+/** Master switch. false = existing ephemeral behaviour, completely unchanged. */
+export const PERSISTENT_DEPOSIT_ADDRESSES =
+  (process.env.PERSISTENT_DEPOSIT_ADDRESSES || 'false') === 'true';
+
+/**
+ * BIP-39 mnemonic that deterministically derives every deposit key.
+ * When set, the database stores ONLY a derivation index — no key material at rest.
+ * BACK THIS UP OFFLINE. Losing it means losing access to every deposit address.
+ * Leave blank to fall back to random keys encrypted with DEPOSIT_WALLET_SECRET.
+ */
+export const DEPOSIT_HD_MNEMONIC = (process.env.DEPOSIT_HD_MNEMONIC || '').trim();
+export const DEPOSIT_HD_PASSPHRASE = process.env.DEPOSIT_HD_PASSPHRASE || '';
+
+/** Secret for AES-256-GCM key encryption. Falls back to the existing var so every
+ *  legacy `pending_deposits.privateKeyEncrypted` row keeps decrypting unchanged. */
+export const DEPOSIT_WALLET_SECRET =
+  (process.env.DEPOSIT_WALLET_SECRET || process.env.EPHEMERAL_WALLET_SECRET || 'dev-only-change-me').trim();
+
+/** Also store an encrypted copy alongside the HD index. Belt and braces during
+ *  migration; set false once the mnemonic backup has been verified. */
+export const DEPOSIT_KEY_BACKUP = (process.env.DEPOSIT_KEY_BACKUP || 'true') === 'true';
+
+// Scanner tuning
+export const DEPOSIT_SCAN_INTERVAL_MS = Number(process.env.DEPOSIT_SCAN_INTERVAL_MS || '15000');
+export const DEPOSIT_SCAN_CONFIRMATIONS = Number(process.env.DEPOSIT_SCAN_CONFIRMATIONS || '12');
+export const DEPOSIT_SCAN_MAX_SPAN = Number(process.env.DEPOSIT_SCAN_MAX_SPAN || '5000');
+export const DEPOSIT_SCAN_CHUNK_BLOCKS = Number(process.env.DEPOSIT_SCAN_CHUNK_BLOCKS || '1000');
+export const DEPOSIT_SCAN_ADDRESS_CHUNK = Number(process.env.DEPOSIT_SCAN_ADDRESS_CHUNK || '200');
+/** Re-read this far back on every Tron poll so a boundary transfer is never skipped. */
+export const TRON_SCAN_OVERLAP_MS = Number(process.env.TRON_SCAN_OVERLAP_MS || '600000');
+
+// Sweep tuning
+export const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || '60000');
+/** Don't spend gas moving dust; it accumulates and sweeps on a later pass. */
+export const SWEEP_MIN_AMOUNT_USD = Number(process.env.SWEEP_MIN_AMOUNT_USD || '1');
+
+/**
+ * BSC_PROVIDER_URL may be a COMMA-SEPARATED failover list. Anything that constructs a
+ * single JsonRpcProvider must use this, never the raw value — passing the whole list
+ * produces `getaddrinfo ENOTFOUND host,https`.
+ */
+export const BSC_PRIMARY_RPC =
+  BSC_PROVIDER_URL.split(',').map((u) => u.trim()).filter(Boolean)[0] || BSC_PROVIDER_URL;
+
+/**
+ * Credit deposits from balanceOf when eth_getLogs is unavailable.
+ * Most free BSC endpoints serve eth_call fine but refuse getLogs, so without this a
+ * deposit can sit undetected purely because of an RPC limitation. Amount stays exact;
+ * only sender attribution is lost. Default ON — correctness of the user's balance
+ * matters more than the completeness of the audit trail.
+ */
+export const DEPOSIT_BALANCE_FALLBACK = (process.env.DEPOSIT_BALANCE_FALLBACK || 'true') === 'true';
+/** Give the log scanner this long to book it properly first. */
+export const DEPOSIT_BALANCE_FALLBACK_DELAY_MS = Number(process.env.DEPOSIT_BALANCE_FALLBACK_DELAY_MS || '120000');

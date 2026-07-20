@@ -2,7 +2,7 @@ import { ethers } from 'ethers';
 import {
   BSC_CHAIN_ID,
   ADMIN_WALLET_PRIVATE_KEY,
-  BSC_PROVIDER_URL,
+  BSC_PRIMARY_RPC,
   getCanonicalBscStableDecimals,
   USDC_CONTRACT_ADDRESS,
   USDT_CONTRACT_ADDRESS,
@@ -22,7 +22,7 @@ const decimalsCache: Record<string, number> = {};
 export const isVaultPayoutConfigured = (): boolean =>
   Boolean(VAULT_CONTRACT_ADDRESS && ADMIN_WALLET_PRIVATE_KEY);
 
-const getProvider = () => new ethers.JsonRpcProvider(BSC_PROVIDER_URL, BSC_CHAIN_ID, { staticNetwork: true });
+const getProvider = () => new ethers.JsonRpcProvider(BSC_PRIMARY_RPC, BSC_CHAIN_ID, { staticNetwork: true });
 
 const getDecimals = async (tokenAddr: string, provider: ethers.JsonRpcProvider): Promise<number> => {
   if (decimalsCache[tokenAddr] != null) return decimalsCache[tokenAddr];

@@ -13,6 +13,9 @@ import { depositListener } from './services/depositListener.service';
 import { startEphemeralDepositSweep } from './services/ephemeralDepositSweep.service';
 import { startTronDepositSweep } from './services/tronDepositSweep.service';
 import { startChainSyncWorker } from './services/chainSync.worker';
+import { startBep20DepositScanner } from './services/depositScannerBep20.service';
+import { startTrc20DepositScanner } from './services/depositScannerTrc20.service';
+import { startPersistentSweep } from './services/persistentSweep.service';
 import { reconcileChain } from './services/chainReconcile.service';
 import Routes from './routes';
 import logger from './configs/logger.config';
@@ -83,6 +86,13 @@ connectDB(async (mongooseConn) => {
     startEphemeralDepositSweep();
     startTronDepositSweep();
     startChainSyncWorker();
+
+    // Persistent per-user deposit addresses.
+    // These are NO-OPS unless PERSISTENT_DEPOSIT_ADDRESSES=true, so enabling the
+    // code is safe before enabling the feature.
+    startBep20DepositScanner();
+    startTrc20DepositScanner();
+    startPersistentSweep();
 
     // Nightly on-chain reconciliation (03:30) — catches any user the live attest path missed
     // and stamps the global aggregate so the contract matches the DB.

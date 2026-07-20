@@ -720,6 +720,7 @@ async function tick() {
       status: { $in: ["pending", "credited"] },
       ephemeralAddress: { $exists: true, $nin: [null, ""] },
       network: { $ne: "trc20" }, // Tron deposits are handled by tronDepositSweep — never ethers-decode base58
+      depositAddressId: { $in: [null, undefined] }, // persistent-address rows are handled by persistentSweep
     })
       .limit(50)
       .lean();

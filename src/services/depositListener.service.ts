@@ -1,7 +1,7 @@
 import { ethers } from "ethers";
 import {
   BSC_CHAIN_ID,
-  BSC_PROVIDER_URL,
+  BSC_PRIMARY_RPC,
   getCanonicalBscStableDecimals,
   VAULT_CONTRACT_ADDRESS,
   USDT_CONTRACT_ADDRESS,
@@ -26,7 +26,7 @@ export class DepositListenerService {
   private pollTimer: NodeJS.Timeout | null = null;
 
   constructor() {
-    this.provider = new ethers.JsonRpcProvider(BSC_PROVIDER_URL, BSC_CHAIN_ID, {
+    this.provider = new ethers.JsonRpcProvider(BSC_PRIMARY_RPC, BSC_CHAIN_ID, {
       staticNetwork: true,
     });
     this.provider.on("error", (err) => {
