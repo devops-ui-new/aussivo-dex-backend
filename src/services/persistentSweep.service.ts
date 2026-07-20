@@ -41,10 +41,12 @@ import {
   SWEEP_INTERVAL_MS,
   SWEEP_MIN_AMOUNT_USD,
   DEPOSIT_BALANCE_FALLBACK,
+  DEPOSIT_BALANCE_FALLBACK_CHAINS,
   DEPOSIT_BALANCE_FALLBACK_DELAY_MS,
 } from "../configs/constants";
 import DepositAddressModel from "../models/depositAddress.model";
 import DepositSweepModel from "../models/depositSweep.model";
+import DepositCreditModel from "../models/depositCredit.model";
 import logger from "../configs/logger.config";
 import { resolveDepositPrivateKey, stripHexPrefix } from "../helpers/depositKey.helper";
 import { creditFromBalance } from "./depositAddress.service";
@@ -164,7 +166,11 @@ async function sweepableAmount(
     // credit it from the balance so an RPC limitation can never strand a user's deposit.
     // The delay avoids crediting a transfer the scanner is about to pick up properly.
     const waitedMs = Date.now() - new Date(doc.unexplainedBalanceSince).getTime();
-    if (DEPOSIT_BALANCE_FALLBACK && waitedMs >= DEPOSIT_BALANCE_FALLBACK_DELAY_MS) {
+    // Only on chains whose scanner is unreliable. Running it alongside a WORKING scanner
+    // double-credits, because the two paths use different idempotency keys.
+    const fallbackAllowed =
+      DEPOSIT_BALANCE_FALLBACK && DEPOSIT_BALANCE_FALLBACK_CHAINS.includes(doc.network);
+    if (fallbackAllowed && waitedMs >= DEPOSIT_BALANCE_FALLBACK_DELAY_MS) {
       try {
         const r = await creditFromBalance(doc, excess, decimals, asset, credited + excess);
         if (r === "credited") {
@@ -177,7 +183,7 @@ async function sweepableAmount(
       } catch (e: any) {
         logger.error(`[PersistentSweep] balance-fallback credit failed for ${doc.address}: ${e?.message || e}`);
       }
-    } else if (DEPOSIT_BALANCE_FALLBACK) {
+    } else if (fallbackAllowed) {
       const left = Math.ceil((DEPOSIT_BALANCE_FALLBACK_DELAY_MS - waitedMs) / 1000);
       logger.info(`[PersistentSweep] ${doc.address}: uncredited balance detected, crediting from balance in ~${left}s if the scanner hasn't booked it`);
     }
@@ -218,6 +224,50 @@ async function fundEvmGas(address: string): Promise<string> {
  * including ones previously marked 'failed', because a txHash means it WAS broadcast and
  * its true outcome is knowable from the chain.
  */
+/**
+ * Recompute creditedTotal / sweptTotal from the LEDGERS, not from cached counters.
+ *
+ * The cached fields were maintained by $inc at the moment of each event. Any interruption
+ * — an RPC timeout after a transfer already succeeded, a crash between two writes — left
+ * them permanently wrong, and nothing recomputed them. That is how a swept address kept
+ * showing "awaiting sweep" forever.
+ *
+ * deposit_credits and deposit_sweeps are append-only records of what actually happened,
+ * so summing them is authoritative. Running this every tick makes the totals self-healing:
+ * a cache that drifts is corrected on the next pass rather than staying wrong.
+ */
+async function recomputeTotals(doc: any): Promise<{ credited: bigint; swept: bigint }> {
+  const [creditRows, sweepRows] = await Promise.all([
+    DepositCreditModel.find({ addressId: doc._id, status: "credited" }).select("amountBaseUnits").lean(),
+    DepositSweepModel.find({ addressId: doc._id, status: "confirmed" }).select("amountBaseUnits").lean(),
+  ]);
+
+  let credited = 0n;
+  let swept = 0n;
+  for (const r of creditRows as any[]) { try { credited += BigInt(r.amountBaseUnits); } catch { /* skip malformed */ } }
+  for (const r of sweepRows as any[]) { try { swept += BigInt(r.amountBaseUnits); } catch { /* skip malformed */ } }
+
+  const cachedCredited = d128ToBigInt(doc.creditedTotal);
+  const cachedSwept = d128ToBigInt(doc.sweptTotal);
+
+  if (cachedCredited !== credited || cachedSwept !== swept) {
+    await DepositAddressModel.findByIdAndUpdate(doc._id, {
+      $set: {
+        creditedTotal: credited.toString(),
+        sweptTotal: swept.toString(),
+        creditsCount: creditRows.length,
+      },
+    });
+    logger.info(
+      `[PersistentSweep] ${doc.address}: totals corrected from ledger — ` +
+        `credited ${cachedCredited}→${credited}, swept ${cachedSwept}→${swept}`
+    );
+    doc.creditedTotal = credited.toString();
+    doc.sweptTotal = swept.toString();
+  }
+  return { credited, swept };
+}
+
 async function reconcileBroadcastSweeps(doc: any): Promise<void> {
   const rows = await DepositSweepModel.find({
     addressId: doc._id,
@@ -538,7 +588,9 @@ async function sweepOne(doc: any): Promise<void> {
     // Settle any previously-broadcast sweep FIRST. Must run before the balance checks,
     // which return early on an empty address and would otherwise strand the books.
     await reconcileBroadcastSweeps(doc);
+    // Then re-derive the totals from the ledgers so a drifted cache self-corrects.
     const fresh = (await DepositAddressModel.findById(doc._id)) || doc;
+    await recomputeTotals(fresh);
 
     if (fresh.network === "trc20") {
       await sweepTron(fresh);

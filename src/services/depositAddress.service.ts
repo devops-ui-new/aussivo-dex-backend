@@ -50,7 +50,7 @@ async function nextHdIndex(network: DepositNetwork): Promise<number> {
   const doc = await ScannerStateModel.findOneAndUpdate(
     { key: `hd-index:${network}` },
     { $inc: { counter: 1 } },
-    { upsert: true, new: true }
+    { upsert: true, new: true },
   );
   return Number(doc?.counter ?? 1);
 }
@@ -64,9 +64,13 @@ async function nextHdIndex(network: DepositNetwork): Promise<number> {
  */
 export async function getOrCreateDepositAddress(
   userId: string | Types.ObjectId,
-  network: DepositNetwork
+  network: DepositNetwork,
 ): Promise<any> {
-  const existing = await DepositAddressModel.findOne({ userId, network, status: "active" });
+  const existing = await DepositAddressModel.findOne({
+    userId,
+    network,
+    status: "active",
+  });
   if (existing) return existing;
 
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -87,27 +91,33 @@ export async function getOrCreateDepositAddress(
       });
       logger.info(
         `[DepositAddress] Created ${network} address ${key.address} for user ${userId} ` +
-          `(custody=${key.keySource}${key.derivationPath ? ` path=${key.derivationPath}` : ""})`
+          `(custody=${key.keySource}${key.derivationPath ? ` path=${key.derivationPath}` : ""})`,
       );
       return created;
     } catch (e: any) {
       if (e?.code === 11000) {
         // Either another request created this user's address first, or (vanishingly
         // unlikely) an index collision. Re-read; if the user now has one, use it.
-        const winner = await DepositAddressModel.findOne({ userId, network, status: "active" });
+        const winner = await DepositAddressModel.findOne({
+          userId,
+          network,
+          status: "active",
+        });
         if (winner) return winner;
         continue; // index collision — allocate a fresh one
       }
       throw e;
     }
   }
-  throw new Error(`Could not allocate a ${network} deposit address for user ${userId}`);
+  throw new Error(
+    `Could not allocate a ${network} deposit address for user ${userId}`,
+  );
 }
 
 /** Record which vault the user is currently depositing into. */
 export async function setActiveVault(
   addressId: Types.ObjectId | string,
-  vaultId: Types.ObjectId | string
+  vaultId: Types.ObjectId | string,
 ): Promise<void> {
   await DepositAddressModel.findByIdAndUpdate(addressId, {
     $set: { activeVaultId: vaultId, activeVaultSetAt: new Date() },
@@ -117,7 +127,7 @@ export async function setActiveVault(
 /** Map an on-chain address back to its owner. Used by both scanners. */
 export async function findAddressByOnChain(
   network: DepositNetwork,
-  address: string
+  address: string,
 ): Promise<any | null> {
   return DepositAddressModel.findOne({
     network,
@@ -126,9 +136,13 @@ export async function findAddressByOnChain(
 }
 
 /** Every active address on a chain — the scanner's watch list. */
-export async function listActiveAddresses(network: DepositNetwork): Promise<any[]> {
+export async function listActiveAddresses(
+  network: DepositNetwork,
+): Promise<any[]> {
   return DepositAddressModel.find({ network, status: "active" })
-    .select("_id userId address addressLookup lastScannedTimestampMs lastActivityAt activeVaultSetAt")
+    .select(
+      "_id userId address addressLookup lastScannedTimestampMs lastActivityAt activeVaultSetAt",
+    )
     .lean();
 }
 
@@ -138,8 +152,11 @@ export async function listActiveAddresses(network: DepositNetwork): Promise<any[
  */
 async function resolveVaultForCredit(
   addrDoc: any,
-  asset: string
-): Promise<{ vaultId: Types.ObjectId | null; pendingDepositId: Types.ObjectId | null }> {
+  asset: string,
+): Promise<{
+  vaultId: Types.ObjectId | null;
+  pendingDepositId: Types.ObjectId | null;
+}> {
   // 1. An open deposit session the user started — the strongest signal of intent.
   const intent = await PendingDepositModel.findOne({
     userId: addrDoc.userId,
@@ -150,7 +167,9 @@ async function resolveVaultForCredit(
     .sort({ createdAt: -1 })
     .lean();
   if (intent?.vaultId) {
-    const v = await VaultModel.findById(intent.vaultId).select("_id asset status");
+    const v = await VaultModel.findById(intent.vaultId).select(
+      "_id asset status",
+    );
     if (v && v.asset === asset) {
       return { vaultId: v._id as any, pendingDepositId: intent._id as any };
     }
@@ -158,15 +177,22 @@ async function resolveVaultForCredit(
 
   // 2. Last vault the user opened a QR for.
   if (addrDoc.activeVaultId) {
-    const v = await VaultModel.findById(addrDoc.activeVaultId).select("_id asset status");
+    const v = await VaultModel.findById(addrDoc.activeVaultId).select(
+      "_id asset status",
+    );
     if (v && v.asset === asset && v.status === "active") {
-      return { vaultId: v._id as any, pendingDepositId: (intent?._id as any) || null };
+      return {
+        vaultId: v._id as any,
+        pendingDepositId: (intent?._id as any) || null,
+      };
     }
   }
 
   // 3. Last vault we actually credited for this address.
   if (addrDoc.lastCreditedVaultId) {
-    const v = await VaultModel.findById(addrDoc.lastCreditedVaultId).select("_id asset status");
+    const v = await VaultModel.findById(addrDoc.lastCreditedVaultId).select(
+      "_id asset status",
+    );
     if (v && v.asset === asset && v.status === "active") {
       return { vaultId: v._id as any, pendingDepositId: null };
     }
@@ -178,7 +204,9 @@ async function resolveVaultForCredit(
     .select("vaultId")
     .lean();
   if (lastDep?.vaultId) {
-    const v = await VaultModel.findById(lastDep.vaultId).select("_id asset status");
+    const v = await VaultModel.findById(lastDep.vaultId).select(
+      "_id asset status",
+    );
     if (v && v.asset === asset && v.status === "active") {
       return { vaultId: v._id as any, pendingDepositId: null };
     }
@@ -217,8 +245,13 @@ export interface IncomingTransfer {
  * itself idempotent on `deposits.pendingRequestId`. Both layers must agree before
  * the credit is marked final.
  */
-export async function applyCredit(transfer: IncomingTransfer): Promise<"credited" | "duplicate" | "deferred"> {
-  const addrDoc = await findAddressByOnChain(transfer.network, transfer.toAddress);
+export async function applyCredit(
+  transfer: IncomingTransfer,
+): Promise<"credited" | "duplicate" | "deferred"> {
+  const addrDoc = await findAddressByOnChain(
+    transfer.network,
+    transfer.toAddress,
+  );
   if (!addrDoc) return "duplicate"; // not one of ours — nothing to do
 
   const requestId = `xfer:${transfer.network}:${transfer.txHash}:${transfer.logIndex}`;
@@ -256,12 +289,20 @@ export async function applyCredit(transfer: IncomingTransfer): Promise<"credited
  * Apply accounting for a claimed credit. Split out so the retry loop can re-run it
  * for rows stuck in `detected` without re-detecting anything on chain.
  */
-export async function finalizeCredit(credit: any, addrDocMaybe?: any): Promise<"credited" | "deferred"> {
-  const addrDoc = addrDocMaybe || (await DepositAddressModel.findById(credit.addressId));
+export async function finalizeCredit(
+  credit: any,
+  addrDocMaybe?: any,
+): Promise<"credited" | "deferred"> {
+  const addrDoc =
+    addrDocMaybe || (await DepositAddressModel.findById(credit.addressId));
   if (!addrDoc) return "deferred";
+  if (credit.status === "credited") return "credited"; // already done — never re-count
 
   try {
-    const { vaultId, pendingDepositId } = await resolveVaultForCredit(addrDoc, credit.asset);
+    const { vaultId, pendingDepositId } = await resolveVaultForCredit(
+      addrDoc,
+      credit.asset,
+    );
     if (!vaultId) {
       throw new Error(`No active ${credit.asset} vault to credit into`);
     }
@@ -281,21 +322,44 @@ export async function finalizeCredit(credit: any, addrDocMaybe?: any): Promise<"
         settledAmount: credit.amount,
         depositorAddresses: credit.fromAddress ? [credit.fromAddress] : [],
         skipConfirmationEmail: false,
-      }
+      },
     );
 
-    const deposit = await DepositModel.findOne({ pendingRequestId: credit.requestId }).select("_id");
+    const deposit = await DepositModel.findOne({
+      pendingRequestId: credit.requestId,
+    }).select("_id");
 
-    await DepositCreditModel.findByIdAndUpdate(credit._id, {
-      $set: {
-        status: "credited",
-        creditedAt: new Date(),
-        vaultId,
-        pendingDepositId,
-        depositId: deposit?._id || null,
-        lastError: "",
+    // CLAIM the credit atomically: only the caller that flips detected -> credited may
+    // touch the running totals.
+    //
+    // applyCredit() and retryPendingCredits() can both reach the same row (the retry loop
+    // scans 'detected' rows at the end of every scanner tick). applyDepositAccounting is
+    // idempotent, so no duplicate deposit is created — but an unguarded $inc ran twice and
+    // inflated creditedTotal while the ledger stayed correct. The conditional filter makes
+    // the increment happen exactly once.
+    const claimed = await DepositCreditModel.findOneAndUpdate(
+      { _id: credit._id, status: "detected" },
+      {
+        $set: {
+          status: "credited",
+          creditedAt: new Date(),
+          vaultId,
+          pendingDepositId,
+          depositId: deposit?._id || null,
+          lastError: "",
+        },
       },
-    });
+      { new: true },
+    );
+
+    if (!claimed) {
+      // Someone else finalised this credit. The accounting is already done and already
+      // counted — returning here is what keeps the totals honest.
+      logger.info(
+        `[DepositAddress] credit ${credit._id} already finalised elsewhere — skipping totals`,
+      );
+      return "credited";
+    }
 
     // Running totals + activity marker for tiered scan scheduling.
     await DepositAddressModel.findByIdAndUpdate(addrDoc._id, {
@@ -320,13 +384,13 @@ export async function finalizeCredit(credit: any, addrDocMaybe?: any): Promise<"
             expectedAmount: credit.amount,
             depositorAddresses: credit.fromAddress ? [credit.fromAddress] : [],
           },
-        }
+        },
       );
     }
 
     logger.info(
       `[DepositAddress] Credited ${credit.amount} ${credit.asset} to user ${addrDoc.userId} ` +
-        `from ${credit.txHash.slice(0, 12)}… (${credit.network})`
+        `from ${credit.txHash.slice(0, 12)}… (${credit.network})`,
     );
     return "credited";
   } catch (err: any) {
@@ -341,7 +405,9 @@ export async function finalizeCredit(credit: any, addrDocMaybe?: any): Promise<"
     });
     logger.error(
       `[DepositAddress] Credit ${credit._id} attempt ${attempts} failed: ${err?.message || err}` +
-        (giveUp ? " — MARKED FAILED, needs manual review (funds are safe on the deposit address)" : "")
+        (giveUp
+          ? " — MARKED FAILED, needs manual review (funds are safe on the deposit address)"
+          : ""),
     );
     if (giveUp) {
       await ActivityModel.create({
@@ -349,7 +415,11 @@ export async function finalizeCredit(credit: any, addrDocMaybe?: any): Promise<"
         title: "Deposit credit needs review",
         description: `Transfer ${credit.txHash} could not be booked automatically. Funds are held on the user's deposit address and are recoverable.`,
         type: "system",
-        metadata: { creditId: String(credit._id), txHash: credit.txHash, amount: credit.amount },
+        metadata: {
+          creditId: String(credit._id),
+          txHash: credit.txHash,
+          amount: credit.amount,
+        },
       }).catch(() => {});
     }
     return "deferred";
@@ -391,7 +461,7 @@ export async function creditFromBalance(
   amountBaseUnits: bigint,
   decimals: number,
   asset: "USDT" | "USDC",
-  newCreditedTotal: bigint
+  newCreditedTotal: bigint,
 ): Promise<"credited" | "duplicate" | "deferred"> {
   if (amountBaseUnits <= 0n) return "duplicate";
 
@@ -423,7 +493,7 @@ export async function creditFromBalance(
 
   logger.warn(
     `[DepositAddress] Crediting ${credit.amount} ${asset} for ${addrDoc.address} from BALANCE ` +
-      `(no Transfer log seen — RPC cannot serve eth_getLogs). Amount is exact; sender is unknown.`
+      `(no Transfer log seen — RPC cannot serve eth_getLogs). Amount is exact; sender is unknown.`,
   );
   return finalizeCredit(credit, addrDoc);
 }

@@ -164,7 +164,7 @@ export const DEPOSIT_SCAN_ADDRESS_CHUNK = Number(process.env.DEPOSIT_SCAN_ADDRES
 export const TRON_SCAN_OVERLAP_MS = Number(process.env.TRON_SCAN_OVERLAP_MS || '600000');
 
 // Sweep tuning
-export const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || '60000');
+export const SWEEP_INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || '30000');
 /** Don't spend gas moving dust; it accumulates and sweeps on a later pass. */
 export const SWEEP_MIN_AMOUNT_USD = Number(process.env.SWEEP_MIN_AMOUNT_USD || '1');
 
@@ -184,5 +184,16 @@ export const BSC_PRIMARY_RPC =
  * matters more than the completeness of the audit trail.
  */
 export const DEPOSIT_BALANCE_FALLBACK = (process.env.DEPOSIT_BALANCE_FALLBACK || 'true') === 'true';
+/**
+ * Which chains may use it. Two independent detectors on one chain can credit the SAME
+ * deposit twice, because the scanner keys on txHash while the fallback keys on a
+ * synthetic id — the unique index cannot dedupe across them.
+ *
+ * Default: BSC only. Its eth_getLogs is unreliable on public endpoints, so the fallback
+ * earns its keep there. Tron's TronGrid history API works, so its scanner is sufficient
+ * and a second detector would only create double-credit risk.
+ */
+export const DEPOSIT_BALANCE_FALLBACK_CHAINS =
+  (process.env.DEPOSIT_BALANCE_FALLBACK_CHAINS || 'bep20').split(',').map((c) => c.trim()).filter(Boolean);
 /** Give the log scanner this long to book it properly first. */
-export const DEPOSIT_BALANCE_FALLBACK_DELAY_MS = Number(process.env.DEPOSIT_BALANCE_FALLBACK_DELAY_MS || '120000');
+export const DEPOSIT_BALANCE_FALLBACK_DELAY_MS = Number(process.env.DEPOSIT_BALANCE_FALLBACK_DELAY_MS || '30000');
