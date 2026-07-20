@@ -38,6 +38,14 @@ const DepositSchema = new Schema({
   yieldPaymentsCount: { type: Number, default: 0 },
   // 'matured' is retained in the enum only for legacy documents written before the term cap
   // was removed. New deposits stay 'active' until the user redeems them ('withdrawn').
+  /**
+   * Settled outside the platform (e.g. paid to the user directly by the company).
+   * The row is kept for audit but excluded from every admin total, treasury figure and
+   * public statistic. The user's own portfolio is deliberately unaffected.
+   */
+  excludedFromAccounting: { type: Boolean, default: false, index: true },
+  excludedReason: { type: String, default: '' },
+  excludedAt: { type: Date, default: null },
   status: { type: String, enum: ['active', 'withdrawn', 'matured'], default: 'active' },
   withdrawnAt: { type: Date, default: null },
 }, { timestamps: true, versionKey: false });

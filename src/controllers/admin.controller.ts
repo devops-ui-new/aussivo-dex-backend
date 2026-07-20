@@ -34,6 +34,15 @@ import { BSC_PROVIDER_URL, BSC_CHAIN_ID, PERSISTENT_DEPOSIT_ADDRESSES, TRON_GAS_
 import { CHAIN_MIN_GAS_BNB, REGISTRY_V2_ADDRESS } from '../configs/constants';
 import logger from '../configs/logger.config';
 
+/**
+ * Rows settled outside the platform are closed items. Every admin total, treasury figure
+ * and deposit list filters on this so the numbers reconcile — a UI-only filter would hide
+ * the row while leaving the totals wrong, which is worse than showing it.
+ *
+ * `$ne: true` (rather than `false`) so documents predating the field are still counted.
+ */
+const NOT_EXCLUDED = { excludedFromAccounting: { $ne: true } };
+
 export default class AdminController {
   req: Request;
   res: Response;
@@ -65,12 +74,12 @@ export default class AdminController {
     try {
       const [totalUsers, totalDeposits, activeVaults, totalTVL, pendingWithdrawals, totalYieldDistributed, recentDeposits, feesAgg] = await Promise.all([
         UserModel.countDocuments({ status: 'active' }),
-        DepositModel.countDocuments(),
+        DepositModel.countDocuments(NOT_EXCLUDED),
         VaultModel.countDocuments({ status: 'active' }),
         VaultModel.aggregate([{ $match: { status: 'active' } }, { $group: { _id: null, total: { $sum: '$totalStaked' } } }]),
         WithdrawRequestModel.countDocuments({ status: 'pending' }),
         YieldLogModel.aggregate([{ $match: { source: 'vault_apy' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-        DepositModel.find().populate('userId', 'name email').populate('vaultId', 'name').sort({ createdAt: -1 }).limit(10),
+        DepositModel.find(NOT_EXCLUDED).populate('userId', 'name email').populate('vaultId', 'name').sort({ createdAt: -1 }).limit(10),
         WithdrawRequestModel.aggregate([{ $match: { status: 'completed' } }, { $group: { _id: null, total: { $sum: '$fee' } } }]),
       ]);
 
@@ -104,7 +113,7 @@ export default class AdminController {
       const now = Date.now();
       const STUCK_MS = 3 * 60 * 1000;
       const notSwept = { $or: [{ sweepTxHash: "" }, { sweepTxHash: { $exists: false } }] };
-      const legacyOnly = { depositAddressId: { $in: [null, undefined] } };
+      const legacyOnly = { depositAddressId: { $in: [null, undefined] }, ...NOT_EXCLUDED };
       const r6 = (n: any) => Math.round(Number(n || 0) * 1e6) / 1e6;
 
       const toBig = (v: any): bigint => {
@@ -394,7 +403,7 @@ export default class AdminController {
     try {
       const amountExpr = { $cond: [{ $gt: ['$receivedAmount', 0] }, '$receivedAmount', '$expectedAmount'] };
       const rows = await PendingDepositModel.aggregate([
-        { $match: { status: { $in: ['credited', 'matched'] } } },
+        { $match: { status: { $in: ['credited', 'matched'] }, ...NOT_EXCLUDED } },
         { $group: {
           _id: { network: '$network', status: '$status', asset: '$asset' },
           amount: { $sum: amountExpr },
@@ -420,8 +429,8 @@ export default class AdminController {
 
       // Off-chain view: what's actually credited to user balances (deposits collection).
       const [activeAgg, allAgg] = await Promise.all([
-        DepositModel.aggregate([{ $match: { status: 'active' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
-        DepositModel.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
+        DepositModel.aggregate([{ $match: { status: 'active', ...NOT_EXCLUDED } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+        DepositModel.aggregate([{ $match: NOT_EXCLUDED }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
       ]);
 
       const round = (o: any) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, k === 'count' ? v : Math.round(Number(v) * 1e6) / 1e6]));
@@ -622,7 +631,7 @@ export default class AdminController {
   // ── DEPOSIT MANAGEMENT ──
   async getAllDeposits(page = 1, limit = 20, vaultId?: string, status?: string): Promise<IResponse> {
     try {
-      const query: any = {};
+      const query: any = { ...NOT_EXCLUDED };
       if (vaultId) query.vaultId = vaultId;
       if (status) query.status = status;
       const skip = (page - 1) * limit;
@@ -690,6 +699,76 @@ export default class AdminController {
         let finalTxHash = (txHash || '').trim();
         // Pay the NET amount (gross − early-exit fee). The fee stays in the treasury.
         const netPayout = (request as any).netAmount && (request as any).netAmount > 0 ? (request as any).netAmount : request.amount;
+        const uid = (request.userId as any)?._id || request.userId;
+
+        // ── DEFENCE IN DEPTH: re-check the payout address at approval time ──
+        // The address was validated when the request was created, but wallets can be
+        // unlinked afterwards, and this is the last moment before funds leave.
+        {
+          const payee = await UserModel.findById(uid).select('walletAddress walletAddresses email');
+          const linked = new Set<string>(
+            [
+              ...((payee?.walletAddresses as any) || []).map((w: string) => (w || '').trim().toLowerCase()),
+              (payee?.walletAddress || '').trim().toLowerCase(),
+            ].filter(Boolean)
+          );
+          const dest = String(request.walletAddress || '').trim().toLowerCase();
+          if (!dest || !linked.has(dest)) {
+            await WithdrawRequestModel.findByIdAndUpdate(requestId, {
+              status: 'pending', reviewedBy: null,
+              reviewNote: 'blocked: payout address is not linked to this user',
+            });
+            logger.error(`[WITHDRAW] BLOCKED payout to unlinked address ${dest} for ${payee?.email}`);
+            return {
+              data: null, error: 'Unlinked payout address',
+              message: 'Blocked: the payout address is not linked to this user account. Do not approve this request until it is explained.',
+              status: 403,
+            };
+          }
+        }
+
+        // ── DEBIT FIRST, THEN PAY ──
+        // The debit used to run AFTER the on-chain send. If it then failed (the schema
+        // blocks negative balances), the user had already been paid, the request was
+        // already 'completed', and their balance was never reduced. Debiting first means
+        // an insufficient balance stops the payout instead of discovering it too late.
+        let debitApplied: null | (() => Promise<void>) = null; // compensating refund
+        try {
+          if (request.source === 'deposit' && request.depositId) {
+            const deposit = await DepositModel.findById(request.depositId);
+            if (deposit && deposit.status !== 'withdrawn') {
+              await DepositModel.findByIdAndUpdate(request.depositId, { status: 'withdrawn', withdrawnAt: new Date() });
+              await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: -deposit.amount, totalUsers: -1 } });
+              debitApplied = async () => {
+                await DepositModel.findByIdAndUpdate(request.depositId, { status: 'active', withdrawnAt: null });
+                await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: deposit.amount, totalUsers: 1 } });
+              };
+            }
+          } else if (request.source === 'yield' && request.depositId) {
+            await DepositModel.findByIdAndUpdate(request.depositId, { $inc: { yieldWithdrawn: request.amount } });
+            debitApplied = async () => {
+              await DepositModel.findByIdAndUpdate(request.depositId, { $inc: { yieldWithdrawn: -request.amount } });
+            };
+          } else if (request.source === 'yield') {
+            const f = request.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
+            await UserModel.findByIdAndUpdate(uid, { $inc: { [f]: -request.amount } });
+            debitApplied = async () => { await UserModel.findByIdAndUpdate(uid, { $inc: { [f]: request.amount } }); };
+          } else if (request.source === 'referral') {
+            await UserModel.findByIdAndUpdate(uid, { $inc: { referralEarnings: -request.amount } });
+            debitApplied = async () => { await UserModel.findByIdAndUpdate(uid, { $inc: { referralEarnings: request.amount } }); };
+          }
+        } catch (err: any) {
+          // Usually the negative-balance guard: the user cannot cover this withdrawal.
+          await WithdrawRequestModel.findByIdAndUpdate(requestId, {
+            status: 'pending', reviewedBy: null, reviewNote: `debit failed: ${err.message}`,
+          });
+          logger.error(`[WITHDRAW] Debit failed for ${requestId}: ${err.message}`);
+          return {
+            data: null, error: err.message,
+            message: `Cannot approve: the balance could not be debited (${err.message}). Nothing was paid out.`,
+            status: 400,
+          };
+        }
 
         // If no manual hash supplied and the vault signer is configured, auto-pay on-chain.
         if (!finalTxHash && isVaultPayoutConfigured()) {
@@ -702,51 +781,45 @@ export default class AdminController {
             });
             finalTxHash = result.txHash;
           } catch (err: any) {
-            // Revert the claim so the admin can retry (assumes tx did not land; admin must verify on-chain if ambiguous).
+            // Payout failed — undo the debit so the user is made whole, and put the
+            // request back in the queue.
+            if (debitApplied) {
+              try { await debitApplied(); } catch (e: any) {
+                logger.error(`[WITHDRAW] REFUND FAILED for ${requestId}: ${e.message} — NEEDS MANUAL CORRECTION`);
+              }
+            }
             await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'pending', reviewedBy: null, reviewNote: `payout failed: ${err.message}` });
             const lowGas = err?.code === 'INSUFFICIENT_FUNDS' || /insufficient funds/i.test(err?.message || '');
             const friendly = lowGas
-              ? 'Payout wallet is out of BNB for gas. Top up the payout wallet with BNB and approve again (the request is back to pending — nothing was lost).'
-              : `On-chain payout failed: ${err.message}`;
+              ? 'Payout wallet is out of BNB for gas. Top up the payout wallet with BNB and approve again (the request is back to pending and the balance was restored).'
+              : `On-chain payout failed: ${err.message}. The balance was restored and the request is back to pending.`;
             return { data: null, error: err.message, message: friendly, status: 500 };
           }
         }
 
         await WithdrawRequestModel.findByIdAndUpdate(requestId, { status: 'completed', txHash: finalTxHash });
-        // userId may be a populated doc here — resolve to a plain id for the $inc updates.
-        const uid = (request.userId as any)?._id || request.userId;
         await UserModel.findByIdAndUpdate(uid, { $inc: { totalWithdrawn: request.amount } });
 
-        // ── The balance change happens HERE, on approval — never at submit time. ──
+        // ── Post-payout side effects ONLY ──
+        // The balance debit already happened above, before the payout. Repeating it here
+        // would debit twice. This block is limited to on-chain mirrors and attestations,
+        // all of which are fire-and-forget and never block the withdrawal.
         if (request.source === 'deposit' && request.depositId) {
-          // Principal redemption: close the deposit and decrement vault TVL.
           const deposit = await DepositModel.findById(request.depositId);
-          if (deposit && deposit.status !== 'withdrawn') {
-            await DepositModel.findByIdAndUpdate(request.depositId, { status: 'withdrawn', withdrawnAt: new Date() });
-            await VaultModel.findByIdAndUpdate(deposit.vaultId, { $inc: { totalStaked: -deposit.amount, totalUsers: -1 } });
-
-            // On-chain deposit mirror: burn the principal so the mirror reflects CURRENT total.
+          if (deposit) {
+            // Burn the mirror token so it reflects CURRENT total principal.
             void burnForWithdrawal(deposit.amount, String(deposit._id));
 
-            // On-chain registry: if the user now has NO active/matured deposits, deregister them.
+            // If the user now has NO active/matured deposits, deregister them on-chain.
             const remaining = await DepositModel.countDocuments({ userId: uid, status: { $in: ['active', 'matured'] } });
             if (remaining === 0) {
               const u: any = await UserModel.findById(uid).select('walletAddress');
               if (u?.walletAddress) void deregisterUserOnChain(u.walletAddress);
             }
 
-            // v2 attestation: re-sync this user's principal on-chain (drops or lowers it).
+            // Re-sync this user's attested principal on-chain.
             void enqueueAttest(uid);
           }
-        } else if (request.source === 'yield' && request.depositId) {
-          // Per-deposit yield: now mark it withdrawn against that deposit.
-          await DepositModel.findByIdAndUpdate(request.depositId, { $inc: { yieldWithdrawn: request.amount } });
-        } else if (request.source === 'yield') {
-          // Aggregate yield: now debit the yield wallet.
-          const f = request.asset === 'USDT' ? 'yieldWalletUSDT' : 'yieldWalletUSDC';
-          await UserModel.findByIdAndUpdate(uid, { $inc: { [f]: -request.amount } });
-        } else if (request.source === 'referral') {
-          await UserModel.findByIdAndUpdate(uid, { $inc: { referralEarnings: -request.amount } });
         }
 
         await ActivityModel.create({ adminId: this.adminId, title: 'Withdrawal Approved', type: 'admin', metadata: { requestId, amount: request.amount, fee: (request as any).fee || 0, netPaid: netPayout, txHash: finalTxHash } });
@@ -864,7 +937,7 @@ export default class AdminController {
         signerGasBnb(),
         readGlobals(),
         DepositModel.aggregate([
-          { $match: { status: { $in: ['active', 'matured'] } } },
+          { $match: { status: { $in: ['active', 'matured'] }, ...NOT_EXCLUDED } },
           { $group: { _id: null, principal: { $sum: '$amount' }, n: { $sum: 1 } } },
         ]),
         ChainOutbox.aggregate([{ $group: { _id: '$status', c: { $sum: 1 } } }]),
@@ -977,10 +1050,10 @@ export default class AdminController {
         WithdrawRequestModel.aggregate([{ $match: { source: 'referral', status: 'completed' } }, { $group: { _id: null, gross: { $sum: '$amount' }, net: { $sum: '$netAmount' }, count: { $sum: 1 } } }]),
         WithdrawRequestModel.aggregate([{ $match: { source: 'deposit', status: 'completed' } }, { $group: { _id: null, gross: { $sum: '$amount' }, net: { $sum: '$netAmount' }, fees: { $sum: '$fee' }, count: { $sum: 1 }, earlyCount: { $sum: { $cond: ['$early', 1, 0] } } } }]),
         WithdrawRequestModel.aggregate([{ $match: { status: 'pending' } }, { $group: { _id: '$source', gross: { $sum: '$amount' }, count: { $sum: 1 } } }]),
-        DepositModel.aggregate([{ $match: { status: { $in: ['active', 'matured'] } } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
-        DepositModel.aggregate([{ $group: { _id: null, total: { $sum: '$amount' } } }]),
-        DepositModel.aggregate([{ $group: { _id: '$status', count: { $sum: 1 }, amount: { $sum: '$amount' } } }]),
-        DepositModel.find({ status: 'active' }).select('amount apyPercent createdAt').lean(),
+        DepositModel.aggregate([{ $match: { status: { $in: ['active', 'matured'] }, ...NOT_EXCLUDED } }, { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } }]),
+        DepositModel.aggregate([{ $match: NOT_EXCLUDED }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+        DepositModel.aggregate([{ $match: NOT_EXCLUDED }, { $group: { _id: '$status', count: { $sum: 1 }, amount: { $sum: '$amount' } } }]),
+        DepositModel.find({ status: 'active', ...NOT_EXCLUDED }).select('amount apyPercent createdAt').lean(),
       ]);
 
       // Live, un-matured yield across every active deposit (accruing in the current 30-day cycle).

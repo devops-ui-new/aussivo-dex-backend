@@ -136,6 +136,21 @@ async function noteFailure(addrId: any, err: string): Promise<void> {
 }
 
 /**
+ * Clear a stale error once the address has been read successfully.
+ *
+ * `recordSweepTotals` only clears the error on a SUCCESSFUL SWEEP. An address holding
+ * nothing never sweeps, so a one-off RPC timeout stayed pinned to it in the admin panel
+ * indefinitely — reporting a permanent fault where there was a transient blip. If we can
+ * read the chain and there is nothing owed, the previous error is by definition resolved.
+ */
+async function clearStaleError(doc: any): Promise<void> {
+  if (!doc?.lastSweepError) return;
+  await DepositAddressModel.findByIdAndUpdate(doc._id, {
+    $set: { lastSweepError: "", sweepFailureCount: 0 },
+  });
+}
+
+/**
  * Compute how much of the on-chain balance we are permitted to move.
  * Also flags (but does not act on) an unexplained excess.
  */
@@ -309,8 +324,17 @@ async function reconcileBroadcastSweeps(doc: any): Promise<void> {
 async function sweepEvmToken(doc: any, tokenAddr: string, asset: "USDT" | "USDC"): Promise<void> {
   const p = getEvmProvider();
   const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, p);
-  const balance: bigint = await erc20.balanceOf(doc.address);
-  if (balance === 0n) return;
+
+  // An unreadable balance is NOT an error — it is an unknown. Recording it as a sweep
+  // failure put "request timeout" against healthy, empty addresses in the admin panel.
+  const balRead = await readOrNull(`${asset} balance of ${doc.address}`, () => erc20.balanceOf(doc.address));
+  if (balRead === null) return; // retry next tick, nothing to report
+  const balance: bigint = balRead as bigint;
+  if (balance === 0n) {
+    // Read succeeded and the address is empty — any previous error is resolved.
+    await clearStaleError(doc);
+    return;
+  }
 
   const amount = await sweepableAmount(doc, balance, BEP20_DECIMALS, asset);
   if (amount === 0n) return;
@@ -442,7 +466,10 @@ async function sweepTron(doc: any): Promise<void> {
   });
   if (rawBal === null) return; // unknown — retry next tick, never assume empty
   const balance = BigInt(rawBal.toString());
-  if (balance === 0n) return;
+  if (balance === 0n) {
+    await clearStaleError(doc);
+    return;
+  }
 
   const amount = await sweepableAmount(doc, balance, TRON_USDT_DECIMALS, "USDT");
   if (amount === 0n) return;

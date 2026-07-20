@@ -139,7 +139,7 @@ router.get('/stats', async (req, res) => {
         } },
       ]),
       VaultModel.countDocuments({ status: 'active' }),
-      DepositModel.countDocuments(),
+      DepositModel.countDocuments({ excludedFromAccounting: { $ne: true } }),
       WithdrawRequestModel.countDocuments({ status: 'completed' }),
     ]);
     const a = agg[0] || {};

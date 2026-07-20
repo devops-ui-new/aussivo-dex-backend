@@ -58,6 +58,11 @@ const PendingDepositSchema = new Schema(
     sweepTxHash: { type: String, default: "" },
     /** When decryptable private key material was removed from this document. */
     keyPurgedAt: { type: Date, default: null },
+
+    /** Mirrors deposits.excludedFromAccounting — keeps the sweep views consistent. */
+    excludedFromAccounting: { type: Boolean, default: false, index: true },
+    excludedReason: { type: String, default: "" },
+    excludedAt: { type: Date, default: null },
   },
   { timestamps: true, versionKey: false }
 );
